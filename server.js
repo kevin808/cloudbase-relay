@@ -3,19 +3,31 @@
 /**
  * cloudbase-relay
  *
- * 把腾讯云开发 CloudBase 的 AI 能力包装成 OpenAI 兼容接口。
- * 设计运行环境：CloudBase 云托管（容器）。云托管内部 tcb.init({ env }) 免密，
- * 因此不需要把 secretId / secretKey 放到环境变量里。
+ * 把腾讯云开发 CloudBase 的 AI 网关（OpenAI 兼容协议）包装成自己的中转站：
+ *   浏览器/客户端  ->  本服务(RELAY_KEYS 鉴权)  ->  CloudBase 网关(CLOUDBASE_APIKEY)
+ *
+ * 上游: https://<ENV_ID>.api.tcloudbasegateway.com/v1/ai/cloudbase
+ * 不需要 secretId/secretKey，也不需要 @cloudbase/node-sdk。
  */
 
 const crypto = require("crypto");
+const { Readable } = require("stream");
 const express = require("express");
-const tcb = require("@cloudbase/node-sdk");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
-const ENV_ID = process.env.TCB_ENV;
+const ENV_ID = process.env.TCB_ENV || "";
 
-// 成长计划当前可抵扣的模型，其他模型调用不会消耗免费额度
+// 上游 API Key：云开发控制台 -> 环境 -> API Key
+const API_KEY =
+  process.env.CLOUDBASE_APIKEY || process.env.CLOUDBASE_API_KEY || "";
+
+// 可显式覆盖；否则由 TCB_ENV 拼出来
+const UPSTREAM_BASE = (
+  process.env.UPSTREAM_BASE ||
+  (ENV_ID ? `https://${ENV_ID}.api.tcloudbasegateway.com/v1/ai/cloudbase` : "")
+).replace(/\/+$/, "");
+
+// 成长计划当前可抵扣的模型
 const DEFAULT_MODELS = [
   "hy4",
   "hy4-preview",
@@ -34,26 +46,31 @@ const RELAY_KEYS = (process.env.RELAY_KEYS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!ENV_ID) {
-  console.error("[fatal] 缺少环境变量 TCB_ENV（云开发环境 ID）");
-  process.exit(1);
-}
-if (RELAY_KEYS.length === 0) {
+const UPSTREAM_TIMEOUT_MS = parseInt(
+  process.env.UPSTREAM_TIMEOUT_MS || "600000",
+  10
+);
+
+if (!UPSTREAM_BASE) {
   console.error(
-    "[fatal] 缺少环境变量 RELAY_KEYS（逗号分隔的访问密钥）。网关不要匿名对公网开放。"
+    "[fatal] 缺少 TCB_ENV 或 UPSTREAM_BASE，无法确定上游地址"
   );
   process.exit(1);
 }
-
-const tcbApp = tcb.init({ env: ENV_ID, timeout: 120000 });
-const ai = tcbApp.ai();
-const model = ai.createModel("cloudbase"); // 必须用 cloudbase 分组，hunyuan-v3 已废弃
+if (!API_KEY) {
+  console.error("[fatal] 缺少 CLOUDBASE_APIKEY（云开发控制台 -> API Key）");
+  process.exit(1);
+}
+if (RELAY_KEYS.length === 0) {
+  console.error("[fatal] 缺少 RELAY_KEYS（逗号分隔的访问密钥）");
+  process.exit(1);
+}
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
-/** 恒定时间比较，避免逐字节试探 */
+/** 恒定时间比较 */
 function keyMatches(candidate) {
   const a = Buffer.from(String(candidate || ""));
   return RELAY_KEYS.some((k) => {
@@ -73,44 +90,32 @@ function requireKey(req, res, next) {
   next();
 }
 
-function genId() {
-  return "chatcmpl-" + crypto.randomBytes(12).toString("hex");
-}
-
-/** 归一化不同版本的 usage 字段 */
-function normalizeUsage(u) {
-  if (!u) return undefined;
-  const prompt = u.prompt_tokens ?? u.input_tokens ?? u.inputTokens;
-  const completion = u.completion_tokens ?? u.output_tokens ?? u.outputTokens;
-  const total = u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0);
-  return {
-    prompt_tokens: prompt,
-    completion_tokens: completion,
-    total_tokens: total,
-    raw: u,
-  };
-}
-
-/** 上游错误 → 合理的 HTTP 状态码 */
-function upstreamError(err, res) {
-  const msg = String((err && err.message) || err);
-  const isConcurrency = /EXCEED_CONCURRENT_REQUEST_LIMIT/i.test(msg);
-  const isQuota = /quota|exceed|额度|resource/i.test(msg) && !isConcurrency;
-  const status = isConcurrency || isQuota ? 429 : 502;
-  if (!res.headersSent) {
-    res.status(status).json({
-      error: {
-        type: isConcurrency ? "rate_limit_error" : "upstream_error",
-        code: isConcurrency ? "EXCEED_CONCURRENT_REQUEST_LIMIT" : "UPSTREAM_ERROR",
-        message: msg,
-      },
-    });
-  } else {
-    res.end();
+/** 只转发上游认识的字段，避免把我们的私有字段漏过去 */
+function buildPayload(body) {
+  const allowed = [
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "tools",
+    "tool_choice",
+    "stop",
+    "response_format",
+  ];
+  const out = {};
+  for (const k of allowed) {
+    if (body[k] !== undefined) out[k] = body[k];
   }
+  return out;
 }
 
-app.get("/healthz", (_req, res) => res.json({ ok: true, env: ENV_ID }));
+app.get("/healthz", (_req, res) =>
+  res.json({ ok: true, upstream: UPSTREAM_BASE, env: ENV_ID || null })
+);
 
 app.get("/v1/models", requireKey, (_req, res) => {
   res.json({
@@ -125,103 +130,111 @@ app.get("/v1/models", requireKey, (_req, res) => {
 });
 
 app.post("/v1/chat/completions", requireKey, async (req, res) => {
-  const { model: modelName, messages, stream, temperature, max_tokens, top_p } = req.body || {};
+  const body = req.body || {};
 
-  if (!ALLOWED_MODELS.includes(modelName)) {
+  if (!ALLOWED_MODELS.includes(body.model)) {
     return res.status(400).json({
       error: {
         type: "invalid_request_error",
-        message: `model "${modelName}" 不在允许列表内，可选：${ALLOWED_MODELS.join(", ")}`,
+        message: `model "${body.model}" 不在允许列表内，可选：${ALLOWED_MODELS.join(", ")}`,
       },
     });
   }
-  if (!Array.isArray(messages) || messages.length === 0) {
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return res.status(400).json({
       error: { type: "invalid_request_error", message: "messages 不能为空" },
     });
   }
 
-  const params = { model: modelName, messages };
-  if (typeof temperature === "number") params.temperature = temperature;
-  if (typeof top_p === "number") params.top_p = top_p;
-  if (typeof max_tokens === "number") params.max_tokens = max_tokens;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
-  const id = genId();
-  const created = Math.floor(Date.now() / 1000);
-
+  let upstream;
   try {
-    if (stream) {
-      const r = await model.streamText(params);
-
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.flushHeaders?.();
-
-      let aborted = false;
-      req.on("close", () => {
-        aborted = true;
-      });
-
-      const chunk = (delta, finish = null) =>
-        `data: ${JSON.stringify({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: modelName,
-          choices: [{ index: 0, delta, finish_reason: finish }],
-        })}\n\n`;
-
-      res.write(chunk({ role: "assistant" }));
-
-      for await (const text of r.textStream) {
-        if (aborted) break;
-        if (text) res.write(chunk({ content: text }));
-      }
-
-      if (!aborted) {
-        res.write(chunk({}, "stop"));
-        res.write("data: [DONE]\n\n");
-        res.end();
-      } else {
-        res.end();
-      }
-      return;
-    }
-
-    const r = await model.generateText(params);
-    res.json({
-      id,
-      object: "chat.completion",
-      created,
-      model: modelName,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: r.text || "" },
-          finish_reason: "stop",
-        },
-      ],
-      usage: normalizeUsage(r.usage),
+    upstream = await fetch(`${UPSTREAM_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+        Accept: body.stream ? "text/event-stream" : "application/json",
+      },
+      body: JSON.stringify(buildPayload(body)),
+      signal: controller.signal,
     });
   } catch (err) {
+    clearTimeout(timer);
+    const aborted = err && err.name === "AbortError";
     console.error("[upstream]", err && err.message);
-    upstreamError(err, res);
+    return res.status(aborted ? 504 : 502).json({
+      error: {
+        type: "upstream_error",
+        message: aborted ? "上游超时" : `上游请求失败: ${err.message}`,
+      },
+    });
+  }
+
+  // 把上游的错误原样透传，方便定位是 Key 无效 / 额度不足 / 模型未开启
+  if (!upstream.ok) {
+    clearTimeout(timer);
+    const text = await upstream.text().catch(() => "");
+    console.error("[upstream]", upstream.status, text.slice(0, 500));
+    res.status(upstream.status);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.send(text || JSON.stringify({ error: { message: "upstream error" } }));
+    return;
+  }
+
+  if (body.stream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
+
+    const src = Readable.fromWeb(upstream.body);
+    src.on("data", (c) => res.write(c));
+    src.on("end", () => {
+      clearTimeout(timer);
+      res.end();
+    });
+    src.on("error", (e) => {
+      clearTimeout(timer);
+      console.error("[stream]", e.message);
+      res.end();
+    });
+    req.on("close", () => {
+      clearTimeout(timer);
+      src.destroy();
+    });
+    return;
+  }
+
+  try {
+    const data = await upstream.json();
+    clearTimeout(timer);
+    res.json(data);
+  } catch (err) {
+    clearTimeout(timer);
+    res.status(502).json({
+      error: { type: "upstream_error", message: "上游返回了非 JSON 响应" },
+    });
   }
 });
 
 app.use((_req, res) =>
-  res.status(404).json({ error: { message: "only /v1/chat/completions and /v1/models" } })
+  res.status(404).json({
+    error: { message: "only /v1/chat/completions and /v1/models" },
+  })
 );
 
 const server = app.listen(PORT, () => {
-  console.log(`[cloudbase-relay] listen :${PORT} env=${ENV_ID} models=${ALLOWED_MODELS.length}`);
+  console.log(
+    `[cloudbase-relay] listen :${PORT} upstream=${UPSTREAM_BASE} models=${ALLOWED_MODELS.length}`
+  );
 });
 
-// 流式响应可能持续很久，关闭 Node 默认的请求超时
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 server.keepAliveTimeout = 120000;

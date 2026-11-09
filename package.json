@@ -1,8 +1,8 @@
 {
   "name": "cloudbase-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "OpenAI-compatible gateway for Tencent CloudBase AI (deployed on CloudBase Run)",
+  "description": "OpenAI-compatible relay in front of the Tencent CloudBase AI gateway",
   "main": "server.js",
   "license": "MIT",
   "engines": {
@@ -12,7 +12,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@cloudbase/node-sdk": "^3.18.3",
     "express": "^4.19.2"
   }
 }
