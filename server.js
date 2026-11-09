@@ -3,11 +3,14 @@
 /**
  * cloudbase-relay
  *
- * 把腾讯云开发 CloudBase 的 AI 网关（OpenAI 兼容协议）包装成自己的中转站：
- *   浏览器/客户端  ->  本服务(RELAY_KEYS 鉴权)  ->  CloudBase 网关(CLOUDBASE_APIKEY)
+ * 把腾讯云开发 CloudBase 的 AI 能力包成 OpenAI 兼容接口。
  *
- * 上游: https://<ENV_ID>.api.tcloudbasegateway.com/v1/ai/cloudbase
- * 不需要 secretId/secretKey，也不需要 @cloudbase/node-sdk。
+ * 两种上游模式：
+ *   MODE=sdk      (默认) 走 @cloudbase/node-sdk —— 只有这个通道能被"小程序成长计划"资源包抵扣
+ *   MODE=gateway 走 API Key + 公网网关 —— 通道被成长计划拒绝(AI_CHANNEL_NOT_ALLOWED)，仅适合非成长计划环境
+ *
+ * 云托管不会自动注入 TENCENTCLOUD_SECRETID/KEY（SDK 在 CBR 环境下也禁用了自动获取），
+ * 因此凭证按下面的顺序解析，见 resolveCreds()。
  */
 
 const crypto = require("crypto");
@@ -16,18 +19,15 @@ const express = require("express");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const ENV_ID = process.env.TCB_ENV || "";
+const MODE = (process.env.MODE || "sdk").toLowerCase();
 
-// 上游 API Key：云开发控制台 -> 环境 -> API Key
-const API_KEY =
-  process.env.CLOUDBASE_APIKEY || process.env.CLOUDBASE_API_KEY || "";
-
-// 可显式覆盖；否则由 TCB_ENV 拼出来
 const UPSTREAM_BASE = (
   process.env.UPSTREAM_BASE ||
   (ENV_ID ? `https://${ENV_ID}.api.tcloudbasegateway.com/v1/ai/cloudbase` : "")
 ).replace(/\/+$/, "");
+const API_KEY =
+  process.env.CLOUDBASE_APIKEY || process.env.CLOUDBASE_API_KEY || "";
 
-// 成长计划当前可抵扣的模型
 const DEFAULT_MODELS = [
   "hy4",
   "hy4-preview",
@@ -51,26 +51,156 @@ const UPSTREAM_TIMEOUT_MS = parseInt(
   10
 );
 
-if (!UPSTREAM_BASE) {
-  console.error(
-    "[fatal] 缺少 TCB_ENV 或 UPSTREAM_BASE，无法确定上游地址"
-  );
+if (!ENV_ID && !UPSTREAM_BASE) {
+  console.error("[fatal] 缺少 TCB_ENV");
   process.exit(1);
 }
-if (!API_KEY) {
-  console.error("[fatal] 缺少 CLOUDBASE_APIKEY（云开发控制台 -> API Key）");
+if (MODE === "gateway" && !API_KEY) {
+  console.error("[fatal] MODE=gateway 需要 CLOUDBASE_APIKEY");
   process.exit(1);
+}
+if (MODE === "sdk" && !hasStaticCreds()) {
+  console.warn(
+    "[warn] 未配置 CLOUDBASE_SECRET_ID/KEY 或 TENCENTCLOUD_SECRETID/KEY，" +
+      "将尝试从每个请求的 x-cloudbase-context 头里取临时凭证；若容器没有该头，请求会失败。"
+  );
 }
 if (RELAY_KEYS.length === 0) {
   console.error("[fatal] 缺少 RELAY_KEYS（逗号分隔的访问密钥）");
   process.exit(1);
 }
 
+function hasStaticCreds() {
+  return Boolean(
+    (process.env.CLOUDBASE_SECRET_ID && process.env.CLOUDBASE_SECRET_KEY) ||
+      (process.env.TENCENTCLOUD_SECRETID && process.env.TENCENTCLOUD_SECRETKEY)
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 凭证解析                                                            */
+/* ------------------------------------------------------------------ */
+
+function fromEnv() {
+  if (process.env.CLOUDBASE_SECRET_ID && process.env.CLOUDBASE_SECRET_KEY) {
+    return {
+      secretId: process.env.CLOUDBASE_SECRET_ID,
+      secretKey: process.env.CLOUDBASE_SECRET_KEY,
+      sessionToken: process.env.CLOUDBASE_SESSION_TOKEN || undefined,
+      source: "env:CLOUDBASE_SECRET_ID",
+    };
+  }
+  if (process.env.TENCENTCLOUD_SECRETID && process.env.TENCENTCLOUD_SECRETKEY) {
+    return {
+      secretId: process.env.TENCENTCLOUD_SECRETID,
+      secretKey: process.env.TENCENTCLOUD_SECRETKEY,
+      sessionToken: process.env.TENCENTCLOUD_SESSIONTOKEN || undefined,
+      source: "env:TENCENTCLOUD_SECRETID",
+    };
+  }
+  return null;
+}
+
+/** 云托管会把上下文放在 x-cloudbase-context 头里，格式是 base64(JSON) */
+function decodeCtxHeader(value) {
+  if (!value) return null;
+  try {
+    const json = JSON.parse(Buffer.from(value, "base64").toString("utf8"));
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+/** 在任意层级里找 secretId/secretKey，兼容 environ 字符串形式 */
+function pickCreds(obj, depth = 0) {
+  if (!obj || depth > 4) return null;
+
+  if (typeof obj === "string") {
+    // "k1=v1;k2=v2" 形式
+    const map = {};
+    for (const seg of obj.split(";")) {
+      const i = seg.indexOf("=");
+      if (i > 0) map[seg.slice(0, i).trim()] = seg.slice(i + 1).trim();
+    }
+    return pickCreds(map, depth + 1);
+  }
+  if (typeof obj !== "object") return null;
+
+  const id =
+    obj.secretId ?? obj.secret_id ?? obj.TENCENTCLOUD_SECRETID;
+  const key =
+    obj.secretKey ?? obj.SecretKey ?? obj.secret_key ?? obj.TENCENTCLOUD_SECRETKEY;
+  if (id && key) {
+    return {
+      secretId: id,
+      secretKey: key,
+      sessionToken:
+        obj.sessionToken ??
+        obj.token ??
+        obj.TENCENTCLOUD_SESSIONTOKEN ??
+        undefined,
+      source: "header:x-cloudbase-context",
+    };
+  }
+
+  for (const v of Object.values(obj)) {
+    const hit = pickCreds(v, depth + 1);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function resolveCreds(req) {
+  return (
+    fromEnv() ||
+    pickCreds(decodeCtxHeader(req.headers["x-cloudbase-context"]))
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* SDK 实例缓存（按凭证指纹）                                           */
+/* ------------------------------------------------------------------ */
+
+let tcb = null;
+function sdk() {
+  if (!tcb) tcb = require("@cloudbase/node-sdk");
+  return tcb;
+}
+
+const appCache = new Map();
+const APP_TTL_MS = 10 * 60 * 1000;
+
+function getApp(creds) {
+  const fp = `${creds.secretId}:${creds.sessionToken || ""}`;
+  const now = Date.now();
+  const hit = appCache.get(fp);
+  if (hit && now - hit.at < APP_TTL_MS) return hit.app;
+
+  const app = sdk().init({
+    env: ENV_ID,
+    secretId: creds.secretId,
+    secretKey: creds.secretKey,
+    sessionToken: creds.sessionToken,
+    timeout: 120000,
+  });
+  appCache.set(fp, { app, at: now });
+  if (appCache.size > 32) {
+    for (const [k, v] of appCache) {
+      if (now - v.at > APP_TTL_MS) appCache.delete(k);
+    }
+  }
+  return app;
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP                                                               */
+/* ------------------------------------------------------------------ */
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
 
-/** 恒定时间比较 */
 function keyMatches(candidate) {
   const a = Buffer.from(String(candidate || ""));
   return RELAY_KEYS.some((k) => {
@@ -90,31 +220,45 @@ function requireKey(req, res, next) {
   next();
 }
 
-/** 只转发上游认识的字段，避免把我们的私有字段漏过去 */
-function buildPayload(body) {
-  const allowed = [
-    "model",
-    "messages",
-    "stream",
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "presence_penalty",
-    "frequency_penalty",
-    "tools",
-    "tool_choice",
-    "stop",
-    "response_format",
-  ];
-  const out = {};
-  for (const k of allowed) {
-    if (body[k] !== undefined) out[k] = body[k];
-  }
-  return out;
+function sseHeaders(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+}
+
+function sseChunk({ id, created, model, delta, finish }) {
+  return `data: ${JSON.stringify({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+  })}\n\n`;
+}
+
+function normalizeUsage(u) {
+  if (!u) return undefined;
+  const prompt = u.prompt_tokens ?? u.input_tokens ?? u.inputTokens;
+  const completion = u.completion_tokens ?? u.output_tokens ?? u.outputTokens;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0),
+  };
 }
 
 app.get("/healthz", (_req, res) =>
-  res.json({ ok: true, upstream: UPSTREAM_BASE, env: ENV_ID || null })
+  res.json({
+    ok: true,
+    mode: MODE,
+    env: ENV_ID || null,
+    upstream: MODE === "gateway" ? UPSTREAM_BASE : "sdk:@cloudbase/node-sdk",
+    staticCreds: hasStaticCreds(),
+  })
 );
 
 app.get("/v1/models", requireKey, (_req, res) => {
@@ -129,25 +273,93 @@ app.get("/v1/models", requireKey, (_req, res) => {
   });
 });
 
-app.post("/v1/chat/completions", requireKey, async (req, res) => {
-  const body = req.body || {};
+/* --------------------------- SDK 模式 ------------------------------ */
 
-  if (!ALLOWED_MODELS.includes(body.model)) {
-    return res.status(400).json({
+async function handleSdk(req, res, body) {
+  const creds = resolveCreds(req);
+  if (!creds) {
+    return res.status(500).json({
       error: {
-        type: "invalid_request_error",
-        message: `model "${body.model}" 不在允许列表内，可选：${ALLOWED_MODELS.join(", ")}`,
+        type: "config_error",
+        message:
+          "拿不到腾讯云凭证：请配置 CLOUDBASE_SECRET_ID/CLOUDBASE_SECRET_KEY，" +
+          "或确认容器收到 x-cloudbase-context 头。",
       },
     });
   }
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return res.status(400).json({
-      error: { type: "invalid_request_error", message: "messages 不能为空" },
-    });
+
+  const params = {
+    model: body.model,
+    messages: body.messages,
+  };
+  for (const k of ["temperature", "top_p", "max_tokens", "stop"]) {
+    if (body[k] !== undefined) params[k] = body[k];
   }
 
+  const model = getApp(creds).ai().createModel("cloudbase");
+  const id = "chatcmpl-" + crypto.randomBytes(12).toString("hex");
+  const created = Math.floor(Date.now() / 1000);
+
+  if (body.stream) {
+    const r = await model.streamText(params);
+    sseHeaders(res);
+    let aborted = false;
+    req.on("close", () => {
+      aborted = true;
+    });
+    res.write(sseChunk({ id, created, model: body.model, delta: { role: "assistant" } }));
+    for await (const text of r.textStream) {
+      if (aborted) break;
+      if (text) res.write(sseChunk({ id, created, model: body.model, delta: { content: text } }));
+    }
+    if (!aborted) {
+      res.write(sseChunk({ id, created, model: body.model, delta: {}, finish: "stop" }));
+      res.write("data: [DONE]\n\n");
+    }
+    res.end();
+    return;
+  }
+
+  const r = await model.generateText(params);
+  res.json({
+    id,
+    object: "chat.completion",
+    created,
+    model: body.model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: r.text || "" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: normalizeUsage(r.usage),
+  });
+}
+
+/* ------------------------- Gateway 模式 ---------------------------- */
+
+async function handleGateway(req, res, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const payload = {
+    model: body.model,
+    messages: body.messages,
+  };
+  for (const k of [
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "stop",
+    "tools",
+    "tool_choice",
+    "response_format",
+  ]) {
+    if (body[k] !== undefined) payload[k] = body[k];
+  }
 
   let upstream;
   try {
@@ -158,7 +370,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
         "Content-Type": "application/json",
         Accept: body.stream ? "text/event-stream" : "application/json",
       },
-      body: JSON.stringify(buildPayload(body)),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
   } catch (err) {
@@ -173,7 +385,6 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
     });
   }
 
-  // 把上游的错误原样透传，方便定位是 Key 无效 / 额度不足 / 模型未开启
   if (!upstream.ok) {
     clearTimeout(timer);
     const text = await upstream.text().catch(() => "");
@@ -185,14 +396,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
   }
 
   if (body.stream) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    res.flushHeaders?.();
-
+    sseHeaders(res);
     const src = Readable.fromWeb(upstream.body);
     src.on("data", (c) => res.write(c));
     src.on("end", () => {
@@ -215,10 +419,51 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
     const data = await upstream.json();
     clearTimeout(timer);
     res.json(data);
-  } catch (err) {
+  } catch {
     clearTimeout(timer);
     res.status(502).json({
       error: { type: "upstream_error", message: "上游返回了非 JSON 响应" },
+    });
+  }
+}
+
+/* ---------------------------- 路由 -------------------------------- */
+
+app.post("/v1/chat/completions", requireKey, async (req, res) => {
+  const body = req.body || {};
+
+  if (!ALLOWED_MODELS.includes(body.model)) {
+    return res.status(400).json({
+      error: {
+        type: "invalid_request_error",
+        message: `model "${body.model}" 不在允许列表内，可选：${ALLOWED_MODELS.join(", ")}`,
+      },
+    });
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return res.status(400).json({
+      error: { type: "invalid_request_error", message: "messages 不能为空" },
+    });
+  }
+
+  try {
+    if (MODE === "gateway") await handleGateway(req, res, body);
+    else await handleSdk(req, res, body);
+  } catch (err) {
+    const msg = String((err && err.message) || err);
+    console.error("[failed]", msg);
+    if (res.headersSent) return res.end();
+    if (/EXCEED_CONCURRENT_REQUEST_LIMIT/i.test(msg)) {
+      return res.status(429).json({
+        error: {
+          type: "rate_limit_error",
+          code: "EXCEED_CONCURRENT_REQUEST_LIMIT",
+          message: msg,
+        },
+      });
+    }
+    res.status(502).json({
+      error: { type: "upstream_error", message: msg },
     });
   }
 });
@@ -231,7 +476,7 @@ app.use((_req, res) =>
 
 const server = app.listen(PORT, () => {
   console.log(
-    `[cloudbase-relay] listen :${PORT} upstream=${UPSTREAM_BASE} models=${ALLOWED_MODELS.length}`
+    `[cloudbase-relay] listen :${PORT} mode=${MODE} env=${ENV_ID || "-"} models=${ALLOWED_MODELS.length}`
   );
 });
 
