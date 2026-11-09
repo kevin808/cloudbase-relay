@@ -34,6 +34,15 @@ body: {"model":"deepseek-v4.1-flash","messages":[...],"stream":true}
 
 ---
 
+## 三个部署形态
+
+| 目录 | 部署为 | 通道 | 流式 |
+| --- | --- | --- | --- |
+| 仓库根目录（`server.js`） | 云托管 / 自有服务器 | `@cloudbase/node-sdk` | ✅ |
+| `cloudbase-fn-relay/` | 微信云函数 | `wx-server-sdk` 的 `cloud.ai()` | ❌ |
+
+两者都属于"云开发 SDK"通道，差别只在部署位置和是否能流式。
+
 ## 鉴权方式（二选一）
 
 | 方式 | 环境变量 | 适合 | 说明 |
