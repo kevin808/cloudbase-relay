@@ -44,6 +44,56 @@ CLOUDBASE_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxx
 
 ---
 
+## 云托管设置步骤（按官方允许的通道）
+
+官方口径允许的只有：**在云函数 / 云托管里用 `wx-server-sdk`、`@cloudbase/node-sdk`、`@cloudbase/js-sdk` 调用**。本项目就是 `@cloudbase/node-sdk` 的封装。设置分三步：
+
+### 1. 建子账号并拿 AK/SK
+
+不要用主账号密钥。腾讯云控制台 → 访问管理 → 用户 → 新建子用户，勾选"编程访问"，拿到 `SecretId` / `SecretKey`，然后只给它云开发（CloudBase）相关权限。跑通后可以再收窄。
+
+> 这两个密钥长期有效，等于该子账号的密码。只写进环境变量，别提交仓库、别打进日志。
+
+### 2. 在云托管服务上配环境变量
+
+服务 → 版本 → 环境变量：
+
+```
+TCB_ENV=<你的云开发环境ID>
+CLOUDBASE_SECRET_ID=<子账号 SecretId>
+CLOUDBASE_SECRET_KEY=<子账号 SecretKey>
+RELAY_KEYS=sk-xxxx,sk-yyyy
+MODE=sdk
+```
+
+端口填 `8080`，重新部署。
+
+### 3. 用 /diag 自检，别直接猜
+
+```bash
+curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxxx"
+```
+
+返回里重点看三项：
+
+| 字段 | 含义 |
+| --- | --- |
+| `creds.source` | `env:CLOUDBASE_SECRET_ID` = 环境变量生效；`header:x-cloudbase-context` = 用的是请求头临时凭证 |
+| `creds.found` | `false` 说明两张凭证都没拿到，SDK 必然失败 |
+| `probe.ok` | `true` 表示已经真的打通了一次模型调用，可以开始用 |
+
+`header.topKeys` 会列出 `x-cloudbase-context` 里的字段名（不含值）。如果它是空的、或里面没有 secretId 类字段，就说明该环境不通过请求头下发凭证，**必须配 AK/SK**。
+
+一个正常通过的样子：
+
+```json
+{
+  "mode": "sdk",
+  "creds": { "found": true, "source": "env:CLOUDBASE_SECRET_ID", "hasToken": false },
+  "probe": { "ok": true, "model": "hy4", "ms": 1200, "textLength": 3 }
+}
+```
+
 ## 环境变量
 
 | 变量 | 必填 | 说明 |

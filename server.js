@@ -261,6 +261,57 @@ app.get("/healthz", (_req, res) =>
   })
 );
 
+/**
+ * 诊断接口：不打印任何密钥内容，只报告"凭证从哪来"和"SDK 调用能不能通"。
+ * 部署后先打这个，比直接调 chat 更容易定位。
+ */
+app.get("/diag", requireKey, async (req, res) => {
+  const raw = req.headers["x-cloudbase-context"];
+  const decoded = decodeCtxHeader(raw);
+  const creds = resolveCreds(req);
+
+  const report = {
+    mode: MODE,
+    env: ENV_ID || null,
+    header: {
+      present: Boolean(raw),
+      decodable: Boolean(decoded),
+      topKeys:
+        decoded && typeof decoded === "object" ? Object.keys(decoded) : [],
+    },
+    creds: creds
+      ? { found: true, source: creds.source, hasToken: Boolean(creds.sessionToken) }
+      : { found: false, source: null, hasToken: false },
+  };
+
+  if (!creds || MODE !== "sdk") {
+    report.probe = { ok: false, skipped: true, error: creds ? "mode is not sdk" : "no credentials" };
+    return res.json(report);
+  }
+
+  try {
+    const start = Date.now();
+    const r = await getApp(creds)
+      .ai()
+      .createModel("cloudbase")
+      .generateText({
+        model: ALLOWED_MODELS[0],
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 8,
+      });
+    report.probe = {
+      ok: true,
+      model: ALLOWED_MODELS[0],
+      ms: Date.now() - start,
+      textLength: (r.text || "").length,
+      usage: normalizeUsage(r.usage),
+    };
+  } catch (err) {
+    report.probe = { ok: false, error: String((err && err.message) || err) };
+  }
+  res.json(report);
+});
+
 app.get("/v1/models", requireKey, (_req, res) => {
   res.json({
     object: "list",
