@@ -13,6 +13,7 @@ rm -f "$OUT"
 FILES=(
   server.js
   package.json
+  package-lock.json
   Dockerfile
   .dockerignore
   README.md
