@@ -28,24 +28,54 @@ const REGION = process.env.REGION || process.env.TCB_REGION || "";
 /* ------------------------------------------------------------------ */
 
 /**
- * SDK 的 serviceUrl 只接受主机名（形如 xxx.example.com），
- * 协议和 /v1 路径由 SDK 自己拼。这里把各种写法归一化。
+ * SDK 内部会把 serviceUrl 拼成 "<protocol>://<serviceUrl>/v1"，
+ * 再自己加上 "/ai/<provider>" 和 "/chat/completions"。
+ * 所以 serviceUrl 只接受主机名，多带路径就会拼错。
+ *
+ * 这里允许直接填完整 URL（例如 https://host/v1/ai/cloudbase），
+ * 自动拆出协议、主机名和 provider，也兼容只填主机名的写法。
  */
-function normalizeServiceUrl(input) {
-  if (!input) return "";
-  return String(input)
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .split("/")[0];
+function parseUpstream(input) {
+  if (!input) return null;
+  let s = String(input).trim();
+  if (!s) return null;
+
+  let protocol = "https";
+  const pm = s.match(/^(https?):\/\//i);
+  if (pm) {
+    protocol = pm[1].toLowerCase();
+    s = s.slice(pm[0].length);
+  }
+
+  const parts = s.split("/");
+  const host = (parts.shift() || "").trim();
+  if (!host) return null;
+  const path = "/" + parts.join("/");
+
+  // 从 /v1/ai/<provider> 里取 provider，取不到就用默认值
+  let provider = "cloudbase";
+  const providerMatch = path.match(/\/v1\/ai\/([a-z0-9_.-]+)/i);
+  if (providerMatch) provider = providerMatch[1];
+
+  return { protocol, host, path, provider };
 }
 
-// 唯一必填的连接项：上游网关主机名。给出它就不再需要任何环境 ID。
-const SERVICE_URL = normalizeServiceUrl(
-  process.env.UPSTREAM_HOST ||
+// 唯一必填的连接项：上游地址。完整 URL 或主机名都可以。
+const UPSTREAM = parseUpstream(
+  process.env.UPSTREAM_URL ||
+    process.env.UPSTREAM_HOST ||
     process.env.CLOUDBASE_SERVICE_URL ||
     process.env.UPSTREAM_BASE ||
     ""
 );
+const SERVICE_URL = UPSTREAM ? UPSTREAM.host : "";
+const PROVIDER = UPSTREAM ? UPSTREAM.provider : "cloudbase";
+const PROTOCOL = UPSTREAM ? UPSTREAM.protocol : "https";
+
+/** 规范化后的上游地址，仅用于展示，不含任何密钥 */
+function upstreamDisplay() {
+  return `${PROTOCOL}://${SERVICE_URL}/v1/ai/${PROVIDER}`;
+}
 
 const API_KEY =
   process.env.API_KEY ||
@@ -76,7 +106,9 @@ const RELAY_KEYS = (process.env.RELAY_KEYS || "")
   .filter(Boolean);
 
 if (!SERVICE_URL) {
-  console.error("[fatal] 缺少环境变量 UPSTREAM_HOST（上游网关主机名，例如 xxx.example.com）");
+  console.error(
+    "[fatal] 缺少 UPSTREAM_URL：填完整地址（例如 https://host/v1/ai/cloudbase）或只填主机名"
+  );
   process.exit(1);
 }
 if (RELAY_KEYS.length === 0) {
@@ -323,7 +355,7 @@ app.head("/", rootHandler);
 app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
-    upstreamHost: SERVICE_URL,
+    upstream: upstreamDisplay(),
     sdk: sdkVersion,
     auth: credsFromEnv() ? credsFromEnv().kind : "header-only",
     models: ALLOWED_MODELS.length,
@@ -337,7 +369,7 @@ app.get("/diag", requireKey, async (req, res) => {
   const creds = resolveCreds(req);
 
   const report = {
-    upstreamHost: SERVICE_URL,
+    upstream: upstreamDisplay(),
     sdk: sdkVersion,
     header: {
       present: Boolean(raw),
@@ -358,7 +390,7 @@ app.get("/diag", requireKey, async (req, res) => {
     const start = Date.now();
     const r = await getApp(creds)
       .ai()
-      .createModel("cloudbase")
+      .createModel(PROVIDER)
       .generateText({
         model: ALLOWED_MODELS[0],
         messages: [{ role: "user", content: "ping" }],
@@ -429,7 +461,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
 
   const id = "chatcmpl-" + crypto.randomBytes(12).toString("hex");
   const created = Math.floor(Date.now() / 1000);
-  const model = getApp(creds).ai().createModel("cloudbase");
+  const model = getApp(creds).ai().createModel(PROVIDER);
 
   try {
     if (body.stream) {
@@ -498,10 +530,13 @@ app.use((_req, res) =>
 const server = app.listen(PORT, () => {
   const auth = credsFromEnv();
   console.log(
-    `[cloudbase-relay] listen :${PORT} upstream=${SERVICE_URL} sdk=${sdkVersion} ` +
+    `[relay] listen :${PORT} upstream=${upstreamDisplay()} sdk=${sdkVersion} ` +
       `auth=${auth ? auth.kind : "header-only"} ` +
       `models=${ALLOWED_MODELS.length}`
   );
+  if (PROTOCOL === "http") {
+    console.warn("[warn] 上游协议为 http，但 SDK 固定使用 https，请改用 https 地址");
+  }
   if (!auth) {
     console.warn(
       "[warn] 未配置 SECRET_ID/SECRET_KEY 或 API_KEY，" +

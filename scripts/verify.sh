@@ -13,7 +13,7 @@ set -a
 source ./.env
 set +a
 
-: "${UPSTREAM_HOST:?请先在 .env 里填 UPSTREAM_HOST}"
+: "${UPSTREAM_URL:?请先在 .env 里填 UPSTREAM_URL}"
 : "${RELAY_KEYS:?请先在 .env 里填 RELAY_KEYS}"
 
 PORT="${PORT:-18099}"

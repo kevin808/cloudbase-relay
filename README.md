@@ -51,7 +51,7 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `UPSTREAM_HOST` | ✅ | 上游网关主机名。**只填域名**，不要 `https://`、不要 `/v1` |
+| `UPSTREAM_URL` | ✅ | 上游地址。**可直接填完整 URL**（如 `https://host/v1/ai/<provider>`），协议/主机/provider 会自动解析；只填主机名也兼容 |
 | `RELAY_KEYS` | ✅ | 客户端密钥，逗号分隔；为空拒绝启动 |
 | `SECRET_ID` / `SECRET_KEY` | 推荐 | 密钥对 |
 | `API_KEY` | 可选 | 与密钥对二选一 |
@@ -60,7 +60,7 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 | `PORT` | ❌ | 容器会注入；本地默认 `8080` |
 | `RELAY_LOG` | ❌ | 设 `0` 关闭请求日志 |
 
-> 环境 ID 不用单独填：它已经包含在 `UPSTREAM_HOST` 里。只要给出主机名，SDK 就能解析出完整上游地址（已实测：无环境 ID + 仅主机名可以正常调用）。
+> 环境 ID 不用单独填：它已经包含在上游地址里。SDK 会在该地址后自己追加 `/chat/completions`，所以照抄上游给到 `/v1/ai/<provider>` 这一层即可（`<provider>` 用上游实际给的路径段），不要连带把 `/chat/completions` 也写进去。
 
 默认白名单：`hy4`、`hy4-preview`、`hy3`、`deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017`。
 
@@ -85,7 +85,7 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 
 ### 部署后必配
 
-环境变量填 `UPSTREAM_HOST`、`RELAY_KEYS`、`SECRET_ID`、`SECRET_KEY`，
+环境变量填 `UPSTREAM_URL`、`RELAY_KEYS`、`SECRET_ID`、`SECRET_KEY`，
 监听端口填 `8080`，然后打开公网访问。
 
 > 健康检查：服务对 `/`、`/healthz` 都返回 200，默认健康检查可直接用。
@@ -94,7 +94,7 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 
 ```bash
 curl https://<你的域名>/healthz
-# {"ok":true,"upstreamHost":"...","sdk":"...","auth":"ak","models":5}
+# {"ok":true,"upstream":"https://host/v1/ai/<provider>","sdk":"...","auth":"ak","models":5}
 
 curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 ```
@@ -112,7 +112,7 @@ curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 部署前也可以先在本地跑同一套检查：
 
 ```bash
-cp .env.example .env   # 填 UPSTREAM_HOST / RELAY_KEYS / SECRET_ID / SECRET_KEY
+cp .env.example .env   # 填 UPSTREAM_URL / RELAY_KEYS / SECRET_ID / SECRET_KEY
 ./scripts/verify.sh
 ```
 
@@ -140,7 +140,7 @@ curl -N https://<你的域名>/v1/chat/completions \
 ## 本地跑
 
 ```bash
-cp .env.example .env    # 填好三个值
+cp .env.example .env    # 填好上游地址、访问密钥、密钥对
 npm install
 npm start
 
@@ -165,7 +165,7 @@ docker compose up --build
 | --- | --- |
 | `AI_CHANNEL_NOT_ALLOWED` | 请求没经过 SDK；确认走的是 `server.js` |
 | `missing secretId or secretKey` | 没配密钥对或 API Key，且容器没下发临时凭证 |
-| 上游 401 / `INVALID_ENV` | `UPSTREAM_HOST` 写错，或密钥无权访问该上游 |
+| 上游 401 / `INVALID_ENV` | `UPSTREAM_URL` 写错，或密钥无权访问该上游 |
 | 模型未开启 | 去上游控制台打开对应模型开关 |
 | `EXCEED_CONCURRENT_REQUEST_LIMIT` | 上游并发超限，不支持提升；加重试或换模型 |
 | 容器启动即 unhealthy | 健康检查路径不是 `/` 或 `/healthz`，或必填变量缺失导致进程退出 |
