@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${1:-$ROOT/dist/cloudbase-relay.zip}"
+OUT="${1:-$ROOT/dist/ai-relay.zip}"
 
 cd "$ROOT"
 mkdir -p "$(dirname "$OUT")"

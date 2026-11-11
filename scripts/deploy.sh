@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# 用 CloudBase CLI 部署到云托管。
-# 前置：npm i -g @cloudbase/cli && tcb login
-# 用法：TCB_ENV=xxx RELAY_KEYS=sk-x CLOUDBASE_SECRET_ID=AKID... CLOUDBASE_SECRET_KEY=... ./scripts/deploy.sh
+# 用官方 CLI 部署到云托管。
+# 前置：安装并登录官方 CLI
+# 用法：UPSTREAM_HOST=xxx RELAY_KEYS=sk-x SECRET_ID=... SECRET_KEY=... ./scripts/deploy.sh
 set -euo pipefail
 
-: "${TCB_ENV:?需要 TCB_ENV}"
+: "${UPSTREAM_HOST:?需要 UPSTREAM_HOST}"
 : "${RELAY_KEYS:?需要 RELAY_KEYS}"
-: "${CLOUDBASE_SECRET_ID:?需要 CLOUDBASE_SECRET_ID}"
-: "${CLOUDBASE_SECRET_KEY:?需要 CLOUDBASE_SECRET_KEY}"
+: "${SECRET_ID:?需要 SECRET_ID}"
+: "${SECRET_KEY:?需要 SECRET_KEY}"
+: "${ENV_ID:?需要 ENV_ID（仅 CLI 指定环境用，不传给服务）}"
 
-SERVICE="${SERVICE_NAME:-cloudbase-relay}"
+SERVICE="${SERVICE_NAME:-ai-relay}"
 PORT="${SERVICE_PORT:-8080}"
 
 if ! command -v tcb >/dev/null 2>&1; then
-  echo "未安装 CloudBase CLI，先执行：npm i -g @cloudbase/cli && tcb login" >&2
+  echo "未安装官方 CLI，请先安装并登录" >&2
   exit 1
 fi
 
-echo "==> 部署 $SERVICE 到 $TCB_ENV (port $PORT)"
+echo "==> 部署 $SERVICE (port $PORT)"
 
-# 环境变量通过 --env 传入；tcb run deploy 会把当前目录作为构建上下文
 tcb run deploy \
-  --envId "$TCB_ENV" \
+  --envId "$ENV_ID" \
   --name "$SERVICE" \
   --port "$PORT" \
-  --env "TCB_ENV=$TCB_ENV" \
+  --env "UPSTREAM_HOST=$UPSTREAM_HOST" \
   --env "RELAY_KEYS=$RELAY_KEYS" \
-  --env "CLOUDBASE_SECRET_ID=$CLOUDBASE_SECRET_ID" \
-  --env "CLOUDBASE_SECRET_KEY=$CLOUDBASE_SECRET_KEY" \
+  --env "SECRET_ID=$SECRET_ID" \
+  --env "SECRET_KEY=$SECRET_KEY" \
   --env "RELAY_LOG=1"
 
 echo "==> 部署完成，验证："

@@ -1,8 +1,8 @@
 {
-  "name": "cloudbase-relay",
+  "name": "ai-relay",
   "version": "0.5.0",
   "private": true,
-  "description": "OpenAI-compatible relay for Tencent CloudBase AI (SDK channel, growth-plan compatible)",
+  "description": "OpenAI-compatible relay in front of an upstream AI gateway (SDK channel)",
   "main": "server.js",
   "license": "MIT",
   "engines": {

@@ -13,7 +13,7 @@ set -a
 source ./.env
 set +a
 
-: "${TCB_ENV:?请先在 .env 里填 TCB_ENV}"
+: "${UPSTREAM_HOST:?请先在 .env 里填 UPSTREAM_HOST}"
 : "${RELAY_KEYS:?请先在 .env 里填 RELAY_KEYS}"
 
 PORT="${PORT:-18099}"

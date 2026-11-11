@@ -1,8 +1,8 @@
 services:
-  cloudbase-relay:
+  ai-relay:
     build: .
-    image: cloudbase-relay:local
-    container_name: cloudbase-relay
+    image: ai-relay:local
+    container_name: ai-relay
     restart: unless-stopped
     ports:
       - "8080:8080"

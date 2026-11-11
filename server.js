@@ -1,33 +1,34 @@
 "use strict";
 
 /**
- * cloudbase-relay —— 云托管（CloudBase Run）版
+ * 容器版 OpenAI 兼容中转网关
  *
- * 把腾讯云开发 CloudBase 的 AI 能力包成 OpenAI 兼容接口。
- * 上游一律通过 @cloudbase/node-sdk 调用 —— 这条通道才会被"小程序成长计划"资源包抵扣。
+ * 上游通过官方 SDK 调用，走 SDK 通道（该通道才会被上游的免费额度抵扣）。
  * 裸 HTTP 直连网关会被判定为第三方通道并返回 AI_CHANNEL_NOT_ALLOWED。
  *
  * 鉴权优先级（自动探测）：
- *   1. CLOUDBASE_SECRET_ID / CLOUDBASE_SECRET_KEY   腾讯云子账号密钥（推荐，签名调用）
- *   2. TENCENTCLOUD_SECRETID / TENCENTCLOUD_SECRETKEY 运行时注入的临时密钥
- *   3. CLOUDBASE_APIKEY                              云开发控制台 API Key
- *   4. 请求头 x-cloudbase-context 中的临时凭证        兜底
+ *   1. SECRET_ID / SECRET_KEY          签名调用（推荐）
+ *   2. 运行时注入的临时密钥              自动探测
+ *   3. API_KEY                          无需密钥对时的备选
+ *   4. 请求头里携带的临时凭证            兜底
  */
 
 const crypto = require("crypto");
 const express = require("express");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
-const ENV_ID = process.env.TCB_ENV || "";
-const REGION = process.env.TCB_REGION || "";
 const LOG_REQUESTS = process.env.RELAY_LOG !== "0";
+
+// 环境标识：可选，仅透传给 SDK，不填也能正常工作
+const ENV_ID = process.env.ENV_ID || process.env.TCB_ENV || "";
+const REGION = process.env.REGION || process.env.TCB_REGION || "";
 
 /* ------------------------------------------------------------------ */
 /* 上游地址                                                            */
 /* ------------------------------------------------------------------ */
 
 /**
- * SDK 的 serviceUrl 只接受主机名（形如 xxx.api.tcloudbasegateway.com），
+ * SDK 的 serviceUrl 只接受主机名（形如 xxx.example.com），
  * 协议和 /v1 路径由 SDK 自己拼。这里把各种写法归一化。
  */
 function normalizeServiceUrl(input) {
@@ -38,12 +39,19 @@ function normalizeServiceUrl(input) {
     .split("/")[0];
 }
 
+// 唯一必填的连接项：上游网关主机名。给出它就不再需要任何环境 ID。
 const SERVICE_URL = normalizeServiceUrl(
-  process.env.CLOUDBASE_SERVICE_URL || process.env.UPSTREAM_BASE || ""
+  process.env.UPSTREAM_HOST ||
+    process.env.CLOUDBASE_SERVICE_URL ||
+    process.env.UPSTREAM_BASE ||
+    ""
 );
 
 const API_KEY =
-  process.env.CLOUDBASE_APIKEY || process.env.CLOUDBASE_API_KEY || "";
+  process.env.API_KEY ||
+  process.env.CLOUDBASE_APIKEY ||
+  process.env.CLOUDBASE_API_KEY ||
+  "";
 
 /* ------------------------------------------------------------------ */
 /* 模型白名单                                                          */
@@ -67,8 +75,8 @@ const RELAY_KEYS = (process.env.RELAY_KEYS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!ENV_ID) {
-  console.error("[fatal] 缺少环境变量 TCB_ENV（云开发环境 ID）");
+if (!SERVICE_URL) {
+  console.error("[fatal] 缺少环境变量 UPSTREAM_HOST（上游网关主机名，例如 xxx.example.com）");
   process.exit(1);
 }
 if (RELAY_KEYS.length === 0) {
@@ -81,14 +89,16 @@ if (RELAY_KEYS.length === 0) {
 /* ------------------------------------------------------------------ */
 
 function credsFromEnv() {
-  // 1. 显式子账号密钥
-  if (process.env.CLOUDBASE_SECRET_ID && process.env.CLOUDBASE_SECRET_KEY) {
+  // 1. 显式密钥对（推荐）
+  const sid = process.env.SECRET_ID || process.env.CLOUDBASE_SECRET_ID;
+  const skey = process.env.SECRET_KEY || process.env.CLOUDBASE_SECRET_KEY;
+  if (sid && skey) {
     return {
       kind: "ak",
-      secretId: process.env.CLOUDBASE_SECRET_ID,
-      secretKey: process.env.CLOUDBASE_SECRET_KEY,
-      sessionToken: process.env.CLOUDBASE_SESSION_TOKEN || undefined,
-      source: "env:CLOUDBASE_SECRET_ID",
+      secretId: sid,
+      secretKey: skey,
+      sessionToken: process.env.SESSION_TOKEN || process.env.CLOUDBASE_SESSION_TOKEN || undefined,
+      source: "env:SECRET_ID",
     };
   }
   // 2. 运行时注入的临时密钥（云函数常见，云托管一般没有）
@@ -98,12 +108,12 @@ function credsFromEnv() {
       secretId: process.env.TENCENTCLOUD_SECRETID,
       secretKey: process.env.TENCENTCLOUD_SECRETKEY,
       sessionToken: process.env.TENCENTCLOUD_SESSIONTOKEN || undefined,
-      source: "env:TENCENTCLOUD_SECRETID",
+      source: "env:runtime",
     };
   }
   // 3. 云开发 API Key
   if (API_KEY) {
-    return { kind: "accessKey", accessKey: API_KEY, source: "env:CLOUDBASE_APIKEY" };
+    return { kind: "accessKey", accessKey: API_KEY, source: "env:API_KEY" };
   }
   return null;
 }
@@ -174,7 +184,8 @@ try {
 }
 
 function buildConfig(creds) {
-  const cfg = { env: ENV_ID, timeout: 120000 };
+  const cfg = { timeout: 120000 };
+  if (ENV_ID) cfg.env = ENV_ID;
   if (creds.accessKey) cfg.accessKey = creds.accessKey;
   if (creds.secretId) {
     cfg.secretId = creds.secretId;
@@ -312,8 +323,7 @@ app.head("/", rootHandler);
 app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
-    env: ENV_ID || null,
-    serviceUrl: SERVICE_URL || `${ENV_ID}.api.tcloudbasegateway.com(default)`,
+    upstreamHost: SERVICE_URL,
     sdk: sdkVersion,
     auth: credsFromEnv() ? credsFromEnv().kind : "header-only",
     models: ALLOWED_MODELS.length,
@@ -327,8 +337,7 @@ app.get("/diag", requireKey, async (req, res) => {
   const creds = resolveCreds(req);
 
   const report = {
-    env: ENV_ID || null,
-    serviceUrl: SERVICE_URL || `${ENV_ID}.api.tcloudbasegateway.com(default)`,
+    upstreamHost: SERVICE_URL,
     sdk: sdkVersion,
     header: {
       present: Boolean(raw),
@@ -408,7 +417,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       error: {
         type: "config_error",
         message:
-          "拿不到凭证：配置 CLOUDBASE_SECRET_ID/CLOUDBASE_SECRET_KEY（推荐）或 CLOUDBASE_APIKEY。",
+          "拿不到凭证：配置 SECRET_ID/SECRET_KEY（推荐）或 API_KEY。",
       },
     });
   }
@@ -489,13 +498,13 @@ app.use((_req, res) =>
 const server = app.listen(PORT, () => {
   const auth = credsFromEnv();
   console.log(
-    `[cloudbase-relay] listen :${PORT} env=${ENV_ID} sdk=${sdkVersion} ` +
-      `serviceUrl=${SERVICE_URL || "default"} auth=${auth ? auth.kind : "header-only"} ` +
+    `[cloudbase-relay] listen :${PORT} upstream=${SERVICE_URL} sdk=${sdkVersion} ` +
+      `auth=${auth ? auth.kind : "header-only"} ` +
       `models=${ALLOWED_MODELS.length}`
   );
   if (!auth) {
     console.warn(
-      "[warn] 未配置 CLOUDBASE_SECRET_ID/KEY 或 CLOUDBASE_APIKEY，" +
+      "[warn] 未配置 SECRET_ID/SECRET_KEY 或 API_KEY，" +
         "只能依赖请求头 x-cloudbase-context 里的临时凭证。"
     );
   }

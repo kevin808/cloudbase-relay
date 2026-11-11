@@ -1,8 +1,8 @@
 {
-  "name": "cloudbase-fn-relay",
+  "name": "fn-relay",
   "version": "0.1.0",
   "private": true,
-  "description": "CloudBase AI relay as a WeChat cloud function (wx-server-sdk channel)",
+  "description": "OpenAI-compatible relay packaged as a cloud function (wx-server-sdk channel)",
   "main": "index.js",
   "license": "MIT",
   "dependencies": {

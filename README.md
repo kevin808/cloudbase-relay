@@ -1,112 +1,100 @@
-# cloudbase-relay
+# AI 中转网关
 
-架在腾讯云开发 **CloudBase AI** 前面的 OpenAI 兼容中转站，部署在**云托管（CloudBase Run）**上：对外暴露 `/v1/chat/completions`（含 SSE 流式），内部一律通过 **`@cloudbase/node-sdk`** 调用模型。
+把上游 AI 服务包成 OpenAI 兼容接口，部署在容器服务上。对外提供 `/v1/chat/completions`（含 SSE 流式），内部统一通过官方 SDK 发起调用。
 
 ## 为什么必须走 SDK
 
-成长计划资源包只认两个通道：小程序基础库、云开发 SDK。用 API Key **裸 HTTP** 打
-`https://<env>.api.tcloudbasegateway.com/v1/ai/cloudbase` 会被判成第三方通道：
+上游对免费额度有来源限制，只认两类调用：应用端 SDK、服务端 SDK。**用 API Key 直接拼 HTTP 打网关会被判成第三方通道**：
 
 ```json
-{"code":"AI_CHANNEL_NOT_ALLOWED","message":"小程序成长计划仅支持小程序 SDK 和云开发 SDK 调用"}
+{"code":"AI_CHANNEL_NOT_ALLOWED","message":"仅支持 SDK 调用"}
 ```
 
-而经 SDK 发出的请求，形态是这样的（本地抓包实测）：
+而经 SDK 发出的请求形态是这样的（本地抓包实测）：
 
 ```
-POST /v1/ai/cloudbase/chat/completions
-x-sdk-version: tcb-node-sdk/3.18.7
-user-agent:    tcb-node-sdk/3.18.7
-authorization: TC3-HMAC-SHA256 Credential=<SecretId>/...
+POST /v1/ai/<provider>/chat/completions
+x-sdk-version: <sdk name>/<version>
+user-agent:    <sdk name>/<version>
+authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 ```
 
 **结论：不要自己拼 HTTP 调网关，让 SDK 去发。**
 
-## 三个部署形态
+## 两种部署形态
 
 | 目录 | 部署为 | 通道 | 流式 |
 | --- | --- | --- | --- |
-| 仓库根目录（`server.js`） | 云托管 / 自有服务器 | `@cloudbase/node-sdk` | ✅ |
-| `cloudbase-fn-relay/` | 微信云函数 | `wx-server-sdk` 的 `cloud.ai()` | ❌ |
+| 根目录（`server.js`） | 容器服务 / 自有服务器 | 服务端 SDK | ✅ |
+| `fn-relay/` | 云函数 | 函数运行时 SDK | ❌ |
 
-两者都属于"云开发 SDK"通道，差别只在部署位置和是否支持流式。
+两者都属于"服务端 SDK"通道，差别只在部署位置和是否支持流式。
 
 ---
 
-## 鉴权方式
+## 鉴权
 
 自动探测，优先级从高到低：
 
 | 顺序 | 环境变量 | 调用方式 | 说明 |
 | --- | --- | --- | --- |
-| 1 | `CLOUDBASE_SECRET_ID` + `CLOUDBASE_SECRET_KEY` | TC3 签名 | **推荐**。腾讯云子账号密钥 |
-| 2 | `TENCENTCLOUD_SECRETID` + `TENCENTCLOUD_SECRETKEY` | TC3 签名 | 云函数运行时自带；云托管一般没有 |
-| 3 | `CLOUDBASE_APIKEY` | `Bearer` | 云开发控制台 API Key，免 AK/SK |
-| 4 | 请求头 `x-cloudbase-context` | 临时凭证 | 兜底，容器若下发该头则自动解析 |
+| 1 | `SECRET_ID` + `SECRET_KEY` | 签名 | **推荐**。密钥对 |
+| 2 | 运行时注入的临时密钥 | 签名 | 函数运行时自带；容器服务一般没有 |
+| 3 | `API_KEY` | `Bearer` | 免密钥对的备选 |
+| 4 | 请求头里的临时凭证 | 临时凭证 | 兜底，容器若下发则自动解析 |
 
-> 云托管容器**不会**自动注入腾讯云临时密钥，SDK 在 CBR 环境也禁用了自动获取，
+> 容器**不会**自动注入临时密钥，SDK 在容器环境也禁用了自动获取，
 > 所以至少要配 1 或 3 其中之一，否则会报
-> `missing secretId or secretKey of tencent cloud`。
+> `missing secretId or secretKey`。
 
 ## 环境变量
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `TCB_ENV` | ✅ | 云开发环境 ID |
+| `UPSTREAM_HOST` | ✅ | 上游网关主机名。**只填域名**，不要 `https://`、不要 `/v1` |
 | `RELAY_KEYS` | ✅ | 客户端密钥，逗号分隔；为空拒绝启动 |
-| `CLOUDBASE_SECRET_ID` / `CLOUDBASE_SECRET_KEY` | 推荐 | 子账号密钥 |
-| `CLOUDBASE_APIKEY` | 可选 | 与 AK/SK 二选一 |
-| `CLOUDBASE_SERVICE_URL` | ❌ | 自定义网关主机名，**只填主机名**，不要 `https://` 和 `/v1` |
-| `TCB_REGION` | ❌ | 默认 `ap-shanghai` |
+| `SECRET_ID` / `SECRET_KEY` | 推荐 | 密钥对 |
+| `API_KEY` | 可选 | 与密钥对二选一 |
+| `REGION` | ❌ | 默认 `ap-shanghai` |
 | `ALLOWED_MODELS` | ❌ | 覆盖模型白名单 |
-| `PORT` | ❌ | 云托管会注入；本地默认 `8080` |
+| `PORT` | ❌ | 容器会注入；本地默认 `8080` |
 | `RELAY_LOG` | ❌ | 设 `0` 关闭请求日志 |
+
+> 环境 ID 不用单独填：它已经包含在 `UPSTREAM_HOST` 里。只要给出主机名，SDK 就能解析出完整上游地址（已实测：无环境 ID + 仅主机名可以正常调用）。
 
 默认白名单：`hy4`、`hy4-preview`、`hy3`、`deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017`。
 
 ---
 
-## 部署到云托管
+## 部署
 
 ### 方式 A：代码包部署（无需本地 Docker）
 
 ```bash
 ./scripts/pack.sh
-# -> dist/cloudbase-relay.zip
+# -> dist/ai-relay.zip
 ```
 
-云开发控制台 → 云托管 → 服务 → 版本 → **代码包上传**，选择这个 zip。
-构建时会读到包里的 `Dockerfile`，自动 `npm install --omit=dev` 后启动 `node server.js`。
+控制台 → 容器服务 → 版本 → **代码包上传**，选择这个 zip。
+构建时读取包里的 `Dockerfile`，自动安装依赖后启动 `node server.js`。
 
-### 方式 B：Git 部署
+### 方式 B：Git 部署（备选）
 
-云托管服务 → 设置 → 绑定 GitHub 仓库 `kevin808/cloudbase-relay`，分支 `main`，
-根目录 `/`，端口 `8080`。之后推代码即自动部署。
-
-### 方式 C：CLI 部署
-
-```bash
-npm i -g @cloudbase/cli && tcb login
-
-TCB_ENV=your-env-id \
-RELAY_KEYS=sk-xxx \
-CLOUDBASE_SECRET_ID=AKIDxxxx \
-CLOUDBASE_SECRET_KEY=xxxx \
-./scripts/deploy.sh
-```
+容器服务 → 设置 → 绑定代码仓库，分支 `main`，根目录 `/`，端口 `8080`。
+之后推代码即自动部署。
 
 ### 部署后必配
 
-在服务的环境变量里填 `TCB_ENV`、`RELAY_KEYS`、`CLOUDBASE_SECRET_ID`、`CLOUDBASE_SECRET_KEY`，
+环境变量填 `UPSTREAM_HOST`、`RELAY_KEYS`、`SECRET_ID`、`SECRET_KEY`，
 监听端口填 `8080`，然后打开公网访问。
 
-> 健康检查路径：服务对 `/`、`/healthz` 都返回 200，云托管默认健康检查可以直接用。
+> 健康检查：服务对 `/`、`/healthz` 都返回 200，默认健康检查可直接用。
 
 ## 自检
 
 ```bash
 curl https://<你的域名>/healthz
-# {"ok":true,"env":"...","serviceUrl":"...","sdk":"3.18.7","auth":"ak","models":5}
+# {"ok":true,"upstreamHost":"...","sdk":"...","auth":"ak","models":5}
 
 curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 ```
@@ -115,12 +103,18 @@ curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 
 ```json
 {
-  "creds": { "found": true, "kind": "ak", "source": "env:CLOUDBASE_SECRET_ID" },
+  "creds": { "found": true, "kind": "ak", "source": "env:SECRET_ID" },
   "probe": { "ok": true, "model": "hy4", "ms": 1200, "textLength": 3 }
 }
 ```
 
 `probe.ok=true` 表示真的打通了一次模型调用，可以接客户端了。
+部署前也可以先在本地跑同一套检查：
+
+```bash
+cp .env.example .env   # 填 UPSTREAM_HOST / RELAY_KEYS / SECRET_ID / SECRET_KEY
+./scripts/verify.sh
+```
 
 ## 客户端接入
 
@@ -146,7 +140,7 @@ curl -N https://<你的域名>/v1/chat/completions \
 ## 本地跑
 
 ```bash
-cp .env.example .env    # 填好 TCB_ENV / RELAY_KEYS / AK/SK
+cp .env.example .env    # 填好三个值
 npm install
 npm start
 
@@ -155,24 +149,28 @@ cp .env.example .env
 docker compose up --build
 ```
 
+## 接口
+
+| 路径 | 鉴权 | 说明 |
+| --- | --- | --- |
+| `GET /` | 无 | 健康检查，返回 200 |
+| `GET /healthz` | 无 | 运行状态与当前鉴权方式 |
+| `GET /diag` | 需要 | 自检：凭证来源 + 真实最小调用 |
+| `GET /v1/models` | 需要 | 模型列表 |
+| `POST /v1/chat/completions` | 需要 | 对话，支持 `stream: true` |
+
 ## 排障
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | `AI_CHANNEL_NOT_ALLOWED` | 请求没经过 SDK；确认走的是 `server.js` |
-| `missing secretId or secretKey of tencent cloud` | 没配 AK/SK 或 API Key，且容器没下发 `x-cloudbase-context` |
-| 上游 401 / `INVALID_ENV` | `TCB_ENV` 不对，或密钥无权访问该环境 |
-| 模型未开启 | 去 AI 控制台打开对应模型开关 |
-| `EXCEED_CONCURRENT_REQUEST_LIMIT` | 上游并发超限，官方不支持提升；加重试或换模型 |
-| 云托管启动即 unhealthy | 健康检查路径用了 `/healthz` 以外的旧路径，或环境变量缺失导致进程退出 |
-| 扣的是套餐资源点而非免费额度 | 说明调用没被判定为云开发服务端来源，或被识别成 AI 工具 |
+| `missing secretId or secretKey` | 没配密钥对或 API Key，且容器没下发临时凭证 |
+| 上游 401 / `INVALID_ENV` | `UPSTREAM_HOST` 写错，或密钥无权访问该上游 |
+| 模型未开启 | 去上游控制台打开对应模型开关 |
+| `EXCEED_CONCURRENT_REQUEST_LIMIT` | 上游并发超限，不支持提升；加重试或换模型 |
+| 容器启动即 unhealthy | 健康检查路径不是 `/` 或 `/healthz`，或必填变量缺失导致进程退出 |
+| 扣的是套餐额度而非免费额度 | 说明调用未被判定为服务端来源，或被识别成第三方工具 |
 
-**验证是否真在抵扣免费额度**：调几次后看 [AI 模型用量](https://tcb.cloud.tencent.com/dev#/ai?tab=model-usage)，确认扣的是"免费额度"而不是"套餐资源点"。
-
-## 合规提示
-
-成长计划免费额度仅限小程序与云开发服务端（云函数 / 云托管）使用。官方治理公告把"第三方 API、直接 HTTP 调用"列为违规，处置手段包括暂停该环境的 AI 资源包权限。对外共享给第三方属于风险行为，后果自负。
-
-## License
+## 许可
 
 MIT

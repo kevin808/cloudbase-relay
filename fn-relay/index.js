@@ -1,9 +1,9 @@
 "use strict";
 
 /**
- * cloudbase-fn-relay —— 部署为微信云函数的 AI 中转
+ * fn-relay —— 部署为云函数的 AI 中转
  *
- * 调用通道：wx-server-sdk 的 cloud.ai() → 云开发 SDK（成长计划允许的来源）
+ * 调用通道：wx-server-sdk 的 cloud.ai() → 服务端 SDK（免费额度允许的来源）
  * 支持两种入站方式：
  *   1. 小程序 wx.cloud.callFunction({ name: 'relay', data: {...} })
  *   2. 云函数 HTTP 访问服务（绑定路径后从公网调用，返回 OpenAI 兼容 JSON）
