@@ -18,6 +18,7 @@ const express = require("express");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const LOG_REQUESTS = process.env.RELAY_LOG !== "0";
+const HEALTH_DETAIL = process.env.RELAY_HEALTH_DETAIL || "0";
 
 // 环境标识：可选，仅透传给 SDK，不填也能正常工作
 const ENV_ID = process.env.ENV_ID || process.env.TCB_ENV || "";
@@ -352,15 +353,22 @@ const rootHandler = (_req, res) =>
 app.get("/", rootHandler);
 app.head("/", rootHandler);
 
-app.get("/healthz", (_req, res) =>
+/**
+ * 健康检查：默认只回 {"ok":true}，不在公网暴露上游域名。
+ * 需要看详细信息（上游地址、鉴权方式、模型数）时设 RELAY_HEALTH_DETAIL=1。
+ */
+app.get("/healthz", (_req, res) => {
+  if (HEALTH_DETAIL !== "1") return res.json({ ok: true });
+
+  const auth = credsFromEnv();
   res.json({
     ok: true,
     upstream: upstreamDisplay(),
     sdk: sdkVersion,
-    auth: credsFromEnv() ? credsFromEnv().kind : "header-only",
+    auth: auth ? auth.kind : "header-only",
     models: ALLOWED_MODELS.length,
-  })
-);
+  });
+});
 
 /** 自检：不输出密钥值，只报告来源，并真跑一次最小模型调用 */
 app.get("/diag", requireKey, async (req, res) => {
@@ -530,7 +538,9 @@ app.use((_req, res) =>
 const server = app.listen(PORT, () => {
   const auth = credsFromEnv();
   console.log(
-    `[relay] listen :${PORT} upstream=${upstreamDisplay()} sdk=${sdkVersion} ` +
+    `[relay] listen :${PORT} upstream=${
+      HEALTH_DETAIL === "1" ? upstreamDisplay() : SERVICE_URL
+    } sdk=${sdkVersion} ` +
       `auth=${auth ? auth.kind : "header-only"} ` +
       `models=${ALLOWED_MODELS.length}`
   );

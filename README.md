@@ -59,6 +59,7 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 | `ALLOWED_MODELS` | ❌ | 覆盖模型白名单 |
 | `PORT` | ❌ | 容器会注入；本地默认 `8080` |
 | `RELAY_LOG` | ❌ | 设 `0` 关闭请求日志 |
+| `RELAY_HEALTH_DETAIL` | ❌ | 设 `1` 让 `/healthz` 额外返回上游地址、鉴权方式、模型数；默认只回 `{"ok":true}` |
 
 > 环境 ID 不用单独填：它已经包含在上游地址里。SDK 会在该地址后自己追加 `/chat/completions`，所以照抄上游给到 `/v1/ai/<provider>` 这一层即可（`<provider>` 用上游实际给的路径段），不要连带把 `/chat/completions` 也写进去。
 
@@ -94,7 +95,10 @@ authorization: TC3-HMAC-SHA256 Credential=<SECRET_ID>/...
 
 ```bash
 curl https://<你的域名>/healthz
-# {"ok":true,"upstream":"https://host/v1/ai/<provider>","sdk":"...","auth":"ak","models":5}
+# {"ok":true}            ← 默认不暴露上游地址
+
+# 需要看细节时（仅建议在排查阶段临时开启）：
+# RELAY_HEALTH_DETAIL=1 后返回 upstream / sdk / auth / models
 
 curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 ```
@@ -154,7 +158,7 @@ docker compose up --build
 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- |
 | `GET /` | 无 | 健康检查，返回 200 |
-| `GET /healthz` | 无 | 运行状态与当前鉴权方式 |
+| `GET /healthz` | 无 | 存活检查，默认只返回 `{"ok":true}`；`RELAY_HEALTH_DETAIL=1` 才带细节 |
 | `GET /diag` | 需要 | 自检：凭证来源 + 真实最小调用 |
 | `GET /v1/models` | 需要 | 模型列表 |
 | `POST /v1/chat/completions` | 需要 | 对话，支持 `stream: true` |
