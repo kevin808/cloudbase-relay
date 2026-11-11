@@ -5,3 +5,8 @@ npm-debug.log
 .DS_Store
 *.log
 .env
+.env.*
+dist
+scripts
+cloudbase-fn-relay
+docker-compose.yml

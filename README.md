@@ -1,6 +1,6 @@
 # cloudbase-relay
 
-架在腾讯云开发 **CloudBase AI** 前面的 OpenAI 兼容中转站：对外暴露 `/v1/chat/completions`（含 SSE 流式），内部一律通过 **`@cloudbase/node-sdk`** 调用模型。
+架在腾讯云开发 **CloudBase AI** 前面的 OpenAI 兼容中转站，部署在**云托管（CloudBase Run）**上：对外暴露 `/v1/chat/completions`（含 SSE 流式），内部一律通过 **`@cloudbase/node-sdk`** 调用模型。
 
 ## 为什么必须走 SDK
 
@@ -11,28 +11,16 @@
 {"code":"AI_CHANNEL_NOT_ALLOWED","message":"小程序成长计划仅支持小程序 SDK 和云开发 SDK 调用"}
 ```
 
-而同样的 API Key 交给 SDK，请求会多带三个标记头，通道判定就变成"云开发 SDK"：
-
-```
-X-SDK-Version: tcb-node-sdk/3.18.7
-User-Agent:    tcb-node-sdk/3.18.7
-X-TCB-Source:  ...
-Authorization: Bearer <CLOUDBASE_APIKEY>
-POST /v1/ai/cloudbase/chat/completions
-```
-
-以下是本地抓包实测到的请求（假网关），可作为对照：
+而经 SDK 发出的请求，形态是这样的（本地抓包实测）：
 
 ```
 POST /v1/ai/cloudbase/chat/completions
 x-sdk-version: tcb-node-sdk/3.18.7
-authorization: Bearer <api-key>
-body: {"model":"deepseek-v4.1-flash","messages":[...],"stream":true}
+user-agent:    tcb-node-sdk/3.18.7
+authorization: TC3-HMAC-SHA256 Credential=<SecretId>/...
 ```
 
 **结论：不要自己拼 HTTP 调网关，让 SDK 去发。**
-
----
 
 ## 三个部署形态
 
@@ -41,16 +29,24 @@ body: {"model":"deepseek-v4.1-flash","messages":[...],"stream":true}
 | 仓库根目录（`server.js`） | 云托管 / 自有服务器 | `@cloudbase/node-sdk` | ✅ |
 | `cloudbase-fn-relay/` | 微信云函数 | `wx-server-sdk` 的 `cloud.ai()` | ❌ |
 
-两者都属于"云开发 SDK"通道，差别只在部署位置和是否能流式。
+两者都属于"云开发 SDK"通道，差别只在部署位置和是否支持流式。
 
-## 鉴权方式（二选一）
+---
 
-| 方式 | 环境变量 | 适合 | 说明 |
+## 鉴权方式
+
+自动探测，优先级从高到低：
+
+| 顺序 | 环境变量 | 调用方式 | 说明 |
 | --- | --- | --- | --- |
-| **API Key**（推荐） | `CLOUDBASE_APIKEY` | 云托管 / 自有服务器 | 控制台 → 环境 → [API Key](https://tcb.cloud.tencent.com/dev#/env/apikey)，不用碰 AK/SK |
-| 子账号 AK/SK | `CLOUDBASE_SECRET_ID` + `CLOUDBASE_SECRET_KEY` | 需要按 CAM 权限细粒度控制 | 长期密钥，注意保管 |
+| 1 | `CLOUDBASE_SECRET_ID` + `CLOUDBASE_SECRET_KEY` | TC3 签名 | **推荐**。腾讯云子账号密钥 |
+| 2 | `TENCENTCLOUD_SECRETID` + `TENCENTCLOUD_SECRETKEY` | TC3 签名 | 云函数运行时自带；云托管一般没有 |
+| 3 | `CLOUDBASE_APIKEY` | `Bearer` | 云开发控制台 API Key，免 AK/SK |
+| 4 | 请求头 `x-cloudbase-context` | 临时凭证 | 兜底，容器若下发该头则自动解析 |
 
-还有一条兜底：若容器请求里带 `x-cloudbase-context` 头，会自动解析其中的临时凭证。
+> 云托管容器**不会**自动注入腾讯云临时密钥，SDK 在 CBR 环境也禁用了自动获取，
+> 所以至少要配 1 或 3 其中之一，否则会报
+> `missing secretId or secretKey of tencent cloud`。
 
 ## 环境变量
 
@@ -58,63 +54,73 @@ body: {"model":"deepseek-v4.1-flash","messages":[...],"stream":true}
 | --- | --- | --- |
 | `TCB_ENV` | ✅ | 云开发环境 ID |
 | `RELAY_KEYS` | ✅ | 客户端密钥，逗号分隔；为空拒绝启动 |
-| `CLOUDBASE_APIKEY` | 推荐 | 云开发控制台 API Key |
-| `CLOUDBASE_SECRET_ID` / `CLOUDBASE_SECRET_KEY` | 可选 | 子账号密钥，与 API Key 二选一 |
-| `CLOUDBASE_SERVICE_URL` | ❌ | 自定义网关主机名，默认 `<TCB_ENV>.api.tcloudbasegateway.com`；**只填主机名，不带 https:// 和路径** |
+| `CLOUDBASE_SECRET_ID` / `CLOUDBASE_SECRET_KEY` | 推荐 | 子账号密钥 |
+| `CLOUDBASE_APIKEY` | 可选 | 与 AK/SK 二选一 |
+| `CLOUDBASE_SERVICE_URL` | ❌ | 自定义网关主机名，**只填主机名**，不要 `https://` 和 `/v1` |
 | `TCB_REGION` | ❌ | 默认 `ap-shanghai` |
 | `ALLOWED_MODELS` | ❌ | 覆盖模型白名单 |
-| `PORT` | ❌ | 默认 `8080` |
+| `PORT` | ❌ | 云托管会注入；本地默认 `8080` |
+| `RELAY_LOG` | ❌ | 设 `0` 关闭请求日志 |
 
 默认白名单：`hy4`、`hy4-preview`、`hy3`、`deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017`。
 
-## 部署（云托管）
+---
 
-环境变量：
+## 部署到云托管
 
+### 方式 A：代码包部署（无需本地 Docker）
+
+```bash
+./scripts/pack.sh
+# -> dist/cloudbase-relay.zip
 ```
-TCB_ENV=<你的环境ID>
-CLOUDBASE_APIKEY=<云开发 API Key>
-RELAY_KEYS=sk-xxxx,sk-yyyy
+
+云开发控制台 → 云托管 → 服务 → 版本 → **代码包上传**，选择这个 zip。
+构建时会读到包里的 `Dockerfile`，自动 `npm install --omit=dev` 后启动 `node server.js`。
+
+### 方式 B：Git 部署
+
+云托管服务 → 设置 → 绑定 GitHub 仓库 `kevin808/cloudbase-relay`，分支 `main`，
+根目录 `/`，端口 `8080`。之后推代码即自动部署。
+
+### 方式 C：CLI 部署
+
+```bash
+npm i -g @cloudbase/cli && tcb login
+
+TCB_ENV=your-env-id \
+RELAY_KEYS=sk-xxx \
+CLOUDBASE_SECRET_ID=AKIDxxxx \
+CLOUDBASE_SECRET_KEY=xxxx \
+./scripts/deploy.sh
 ```
 
-端口 `8080`，重新部署。**不需要 `@cloudbase/node-sdk` 之外的任何密钥。**
+### 部署后必配
+
+在服务的环境变量里填 `TCB_ENV`、`RELAY_KEYS`、`CLOUDBASE_SECRET_ID`、`CLOUDBASE_SECRET_KEY`，
+监听端口填 `8080`，然后打开公网访问。
+
+> 健康检查路径：服务对 `/`、`/healthz` 都返回 200，云托管默认健康检查可以直接用。
 
 ## 自检
 
 ```bash
-curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxxx"
+curl https://<你的域名>/healthz
+# {"ok":true,"env":"...","serviceUrl":"...","sdk":"3.18.7","auth":"ak","models":5}
+
+curl https://<你的域名>/diag -H "Authorization: Bearer sk-xxx"
 ```
 
-正常通过：
+正常通过的样子：
 
 ```json
 {
-  "env": "xxx-123",
-  "serviceUrl": "xxx-123.api.tcloudbasegateway.com(default)",
-  "creds": { "found": true, "kind": "accessKey", "source": "env:CLOUDBASE_APIKEY" },
+  "creds": { "found": true, "kind": "ak", "source": "env:CLOUDBASE_SECRET_ID" },
   "probe": { "ok": true, "model": "hy4", "ms": 1200, "textLength": 3 }
 }
 ```
 
-`probe.ok=true` 表示真的打通了一次模型调用，可以开始用客户端接入了。
-
-## 本地跑
-
-```bash
-npm install
-TCB_ENV=your-env-id CLOUDBASE_APIKEY=your-key RELAY_KEYS=sk-dev PORT=8080 npm start
-
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dev" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
-
-# 流式
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dev" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"写首短诗"}]}'
-```
+`probe.ok=true` 表示真的打通了一次模型调用，可以接客户端了。
 
 ## 客户端接入
 
@@ -124,16 +130,42 @@ API Key : <RELAY_KEYS 里的任意一个>
 Model   : deepseek-v4.1-flash
 ```
 
+```bash
+curl https://<你的域名>/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
+
+# 流式
+curl -N https://<你的域名>/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"写首短诗"}]}'
+```
+
+## 本地跑
+
+```bash
+cp .env.example .env    # 填好 TCB_ENV / RELAY_KEYS / AK/SK
+npm install
+npm start
+
+# 或者用容器
+cp .env.example .env
+docker compose up --build
+```
+
 ## 排障
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `AI_CHANNEL_NOT_ALLOWED` | 请求没经过 SDK（例如自己拼的 HTTP）。确认 `server.js` 走的是 SDK 路径 |
-| `missing secretId or secretKey of tencent cloud` | 两种凭证都没拿到，且 SDK 在 CBR 不会自动取临时密钥 → 配 `CLOUDBASE_APIKEY` |
-| 上游 401 / `INVALID_ENV` | API Key 或 `TCB_ENV` 不对 |
+| `AI_CHANNEL_NOT_ALLOWED` | 请求没经过 SDK；确认走的是 `server.js` |
+| `missing secretId or secretKey of tencent cloud` | 没配 AK/SK 或 API Key，且容器没下发 `x-cloudbase-context` |
+| 上游 401 / `INVALID_ENV` | `TCB_ENV` 不对，或密钥无权访问该环境 |
 | 模型未开启 | 去 AI 控制台打开对应模型开关 |
 | `EXCEED_CONCURRENT_REQUEST_LIMIT` | 上游并发超限，官方不支持提升；加重试或换模型 |
-| `CLOUDBASE_SERVICE_URL` 配错 | 只能填主机名，如 `xxx.api.tcloudbasegateway.com`，不能带 `https://` 或 `/v1` |
+| 云托管启动即 unhealthy | 健康检查路径用了 `/healthz` 以外的旧路径，或环境变量缺失导致进程退出 |
+| 扣的是套餐资源点而非免费额度 | 说明调用没被判定为云开发服务端来源，或被识别成 AI 工具 |
 
 **验证是否真在抵扣免费额度**：调几次后看 [AI 模型用量](https://tcb.cloud.tencent.com/dev#/ai?tab=model-usage)，确认扣的是"免费额度"而不是"套餐资源点"。
 

@@ -1,17 +1,17 @@
 "use strict";
 
 /**
- * cloudbase-relay
+ * cloudbase-relay —— 云托管（CloudBase Run）版
  *
  * 把腾讯云开发 CloudBase 的 AI 能力包成 OpenAI 兼容接口。
+ * 上游一律通过 @cloudbase/node-sdk 调用 —— 这条通道才会被"小程序成长计划"资源包抵扣。
+ * 裸 HTTP 直连网关会被判定为第三方通道并返回 AI_CHANNEL_NOT_ALLOWED。
  *
- * 上游一律通过 @cloudbase/node-sdk 调用（通道合法：云开发 SDK），
- * 鉴权支持两种方式：
- *   A. accessKey（= 云开发控制台的 API Key）+ serviceUrl  —— 推荐，不需要 AK/SK
- *   B. secretId/secretKey（腾讯云子账号密钥）              —— 云函数环境可不配
- *
- * 注意：直接裸 HTTP 打网关会被判成"第三方 API"通道并返回 AI_CHANNEL_NOT_ALLOWED，
- * 必须经由 SDK（它会给请求带上 X-SDK-Version 等标记头）。
+ * 鉴权优先级（自动探测）：
+ *   1. CLOUDBASE_SECRET_ID / CLOUDBASE_SECRET_KEY   腾讯云子账号密钥（推荐，签名调用）
+ *   2. TENCENTCLOUD_SECRETID / TENCENTCLOUD_SECRETKEY 运行时注入的临时密钥
+ *   3. CLOUDBASE_APIKEY                              云开发控制台 API Key
+ *   4. 请求头 x-cloudbase-context 中的临时凭证        兜底
  */
 
 const crypto = require("crypto");
@@ -20,21 +20,22 @@ const express = require("express");
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const ENV_ID = process.env.TCB_ENV || "";
 const REGION = process.env.TCB_REGION || "";
+const LOG_REQUESTS = process.env.RELAY_LOG !== "0";
 
 /* ------------------------------------------------------------------ */
 /* 上游地址                                                            */
 /* ------------------------------------------------------------------ */
 
 /**
- * SDK 的 serviceUrl 只接受"主机名"，形如：
- *   my-env-id.api.tcloudbasegateway.com
- * 协议、/v1 都由 SDK 自己拼。这里把各种写法都归一化成主机名。
+ * SDK 的 serviceUrl 只接受主机名（形如 xxx.api.tcloudbasegateway.com），
+ * 协议和 /v1 路径由 SDK 自己拼。这里把各种写法归一化。
  */
 function normalizeServiceUrl(input) {
   if (!input) return "";
-  let s = String(input).trim().replace(/^https?:\/\//i, "");
-  s = s.split("/")[0]; // 去掉 path
-  return s;
+  return String(input)
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .split("/")[0];
 }
 
 const SERVICE_URL = normalizeServiceUrl(
@@ -80,9 +81,7 @@ if (RELAY_KEYS.length === 0) {
 /* ------------------------------------------------------------------ */
 
 function credsFromEnv() {
-  if (API_KEY) {
-    return { kind: "accessKey", accessKey: API_KEY, source: "env:CLOUDBASE_APIKEY" };
-  }
+  // 1. 显式子账号密钥
   if (process.env.CLOUDBASE_SECRET_ID && process.env.CLOUDBASE_SECRET_KEY) {
     return {
       kind: "ak",
@@ -92,6 +91,7 @@ function credsFromEnv() {
       source: "env:CLOUDBASE_SECRET_ID",
     };
   }
+  // 2. 运行时注入的临时密钥（云函数常见，云托管一般没有）
   if (process.env.TENCENTCLOUD_SECRETID && process.env.TENCENTCLOUD_SECRETKEY) {
     return {
       kind: "ak",
@@ -100,6 +100,10 @@ function credsFromEnv() {
       sessionToken: process.env.TENCENTCLOUD_SESSIONTOKEN || undefined,
       source: "env:TENCENTCLOUD_SECRETID",
     };
+  }
+  // 3. 云开发 API Key
+  if (API_KEY) {
+    return { kind: "accessKey", accessKey: API_KEY, source: "env:CLOUDBASE_APIKEY" };
   }
   return null;
 }
@@ -153,13 +157,20 @@ function resolveCreds(req) {
 }
 
 /* ------------------------------------------------------------------ */
-/* SDK 实例                                                            */
+/* SDK                                                                 */
 /* ------------------------------------------------------------------ */
 
 let tcb = null;
 function sdk() {
   if (!tcb) tcb = require("@cloudbase/node-sdk");
   return tcb;
+}
+
+let sdkVersion = "unknown";
+try {
+  sdkVersion = require("@cloudbase/node-sdk/package.json").version;
+} catch {
+  /* ignore */
 }
 
 function buildConfig(creds) {
@@ -193,11 +204,12 @@ function getApp(creds) {
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP                                                               */
+/* HTTP 工具                                                           */
 /* ------------------------------------------------------------------ */
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", true);
 app.use(express.json({ limit: "8mb" }));
 
 function keyMatches(candidate) {
@@ -250,15 +262,65 @@ function normalizeUsage(u) {
   };
 }
 
+/** 上游异常映射：并发超限 → 429，其余 → 502 */
+function sendUpstreamError(res, err) {
+  const msg = String((err && err.message) || err);
+  const code = (err && err.code) || "";
+  console.error("[upstream]", code, msg);
+  if (res.headersSent) return res.end();
+
+  if (/EXCEED_CONCURRENT/i.test(msg) || /EXCEED_CONCURRENT/i.test(code)) {
+    return res.status(429).json({
+      error: {
+        type: "rate_limit_error",
+        code: "EXCEED_CONCURRENT_REQUEST_LIMIT",
+        message: msg,
+      },
+    });
+  }
+  if (/AI_CHANNEL_NOT_ALLOWED/i.test(code) || /AI_CHANNEL_NOT_ALLOWED/i.test(msg)) {
+    return res.status(403).json({
+      error: {
+        type: "channel_error",
+        code: "AI_CHANNEL_NOT_ALLOWED",
+        message: msg,
+      },
+    });
+  }
+  res.status(502).json({
+    error: { type: "upstream_error", code: code || "UPSTREAM_ERROR", message: msg },
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 路由                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 云托管的默认健康检查常常打 "/"，返回 200 才能通过。
+ * 这里不暴露任何密钥信息。
+ */
+const rootHandler = (_req, res) =>
+  res.status(200).json({
+    ok: true,
+    service: "cloudbase-relay",
+    endpoints: ["/v1/models", "/v1/chat/completions", "/healthz", "/diag"],
+  });
+app.get("/", rootHandler);
+app.head("/", rootHandler);
+
 app.get("/healthz", (_req, res) =>
   res.json({
     ok: true,
     env: ENV_ID || null,
     serviceUrl: SERVICE_URL || `${ENV_ID}.api.tcloudbasegateway.com(default)`,
-    credsFromEnv: Boolean(credsFromEnv()),
+    sdk: sdkVersion,
+    auth: credsFromEnv() ? credsFromEnv().kind : "header-only",
+    models: ALLOWED_MODELS.length,
   })
 );
 
+/** 自检：不输出密钥值，只报告来源，并真跑一次最小模型调用 */
 app.get("/diag", requireKey, async (req, res) => {
   const raw = req.headers["x-cloudbase-context"];
   const decoded = decodeCtxHeader(raw);
@@ -267,6 +329,7 @@ app.get("/diag", requireKey, async (req, res) => {
   const report = {
     env: ENV_ID || null,
     serviceUrl: SERVICE_URL || `${ENV_ID}.api.tcloudbasegateway.com(default)`,
+    sdk: sdkVersion,
     header: {
       present: Boolean(raw),
       decodable: Boolean(decoded),
@@ -322,6 +385,7 @@ app.get("/v1/models", requireKey, (_req, res) => {
 });
 
 app.post("/v1/chat/completions", requireKey, async (req, res) => {
+  const startedAt = Date.now();
   const body = req.body || {};
 
   if (!ALLOWED_MODELS.includes(body.model)) {
@@ -344,8 +408,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       error: {
         type: "config_error",
         message:
-          "拿不到凭证：配置 CLOUDBASE_APIKEY（推荐）或 CLOUDBASE_SECRET_ID/KEY，" +
-          "或确认容器收到 x-cloudbase-context 头。",
+          "拿不到凭证：配置 CLOUDBASE_SECRET_ID/CLOUDBASE_SECRET_KEY（推荐）或 CLOUDBASE_APIKEY。",
       },
     });
   }
@@ -362,6 +425,11 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
   try {
     if (body.stream) {
       const r = await model.streamText(params);
+      if (LOG_REQUESTS) {
+        console.log(
+          `[chat] stream model=${body.model} auth=${creds.kind} ttfb=${Date.now() - startedAt}ms`
+        );
+      }
       sseHeaders(res);
       let aborted = false;
       req.on("close", () => {
@@ -377,10 +445,18 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
         res.write("data: [DONE]\n\n");
       }
       res.end();
+      if (LOG_REQUESTS) {
+        console.log(`[chat] stream done abort=${aborted} total=${Date.now() - startedAt}ms`);
+      }
       return;
     }
 
     const r = await model.generateText(params);
+    if (LOG_REQUESTS) {
+      console.log(
+        `[chat] model=${body.model} auth=${creds.kind} total=${Date.now() - startedAt}ms`
+      );
+    }
     res.json({
       id,
       object: "chat.completion",
@@ -396,22 +472,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       usage: normalizeUsage(r.usage),
     });
   } catch (err) {
-    const msg = String((err && err.message) || err);
-    const code = (err && err.code) || "";
-    console.error("[failed]", code, msg);
-    if (res.headersSent) return res.end();
-    if (/EXCEED_CONCURRENT_REQUEST_LIMIT/i.test(msg) || /EXCEED_CONCURRENT/.test(code)) {
-      return res.status(429).json({
-        error: {
-          type: "rate_limit_error",
-          code: "EXCEED_CONCURRENT_REQUEST_LIMIT",
-          message: msg,
-        },
-      });
-    }
-    res.status(502).json({
-      error: { type: "upstream_error", code: code || "UPSTREAM_ERROR", message: msg },
-    });
+    sendUpstreamError(res, err);
   }
 });
 
@@ -421,14 +482,34 @@ app.use((_req, res) =>
   })
 );
 
+/* ------------------------------------------------------------------ */
+/* 启动                                                                */
+/* ------------------------------------------------------------------ */
+
 const server = app.listen(PORT, () => {
+  const auth = credsFromEnv();
   console.log(
-    `[cloudbase-relay] listen :${PORT} env=${ENV_ID} serviceUrl=${
-      SERVICE_URL || `${ENV_ID}.api.tcloudbasegateway.com(default)`
-    } auth=${API_KEY ? "accessKey" : credsFromEnv() ? "ak" : "header"}`
+    `[cloudbase-relay] listen :${PORT} env=${ENV_ID} sdk=${sdkVersion} ` +
+      `serviceUrl=${SERVICE_URL || "default"} auth=${auth ? auth.kind : "header-only"} ` +
+      `models=${ALLOWED_MODELS.length}`
   );
+  if (!auth) {
+    console.warn(
+      "[warn] 未配置 CLOUDBASE_SECRET_ID/KEY 或 CLOUDBASE_APIKEY，" +
+        "只能依赖请求头 x-cloudbase-context 里的临时凭证。"
+    );
+  }
 });
 
+// 流式响应可能持续很久，关掉 Node 默认超时
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 server.keepAliveTimeout = 120000;
+
+function shutdown(signal) {
+  console.log(`[cloudbase-relay] ${signal} received, closing server`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
