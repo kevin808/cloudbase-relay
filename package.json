@@ -1,6 +1,6 @@
 {
   "name": "ai-relay",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "OpenAI-compatible relay in front of an upstream AI gateway (SDK channel)",
   "main": "server.js",

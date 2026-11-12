@@ -153,6 +153,16 @@ cp .env.example .env
 docker compose up --build
 ```
 
+## Token 统计
+
+`usage` 会尽量如实透传，规则：
+
+- **非流式**：返回 `usage.prompt_tokens / completion_tokens / total_tokens`
+- **流式**：在 `[DONE]` 之前补一帧 `choices: []` 且带 `usage` 的 chunk（OpenAI 的 `include_usage` 约定），客户端据此显示用量
+- 请求上游时会自动带上 `stream_options: {include_usage: true}`，因为 SDK 默认不会要 usage
+- 若上游不认这个参数（返回 400），自动降级重试一次，此时拿不到统计
+- **拿不到真实数值时宁可不返回 `usage`，也不返回全 0**，避免客户端显示成 0
+
 ## 接口
 
 | 路径 | 鉴权 | 说明 |

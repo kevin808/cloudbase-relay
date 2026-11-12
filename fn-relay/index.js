@@ -62,16 +62,40 @@ function newId() {
   );
 }
 
+const USAGE_KEYS = ["prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"];
+
 function normalizeUsage(u) {
-  if (!u) return undefined;
+  if (!u || typeof u !== "object") return undefined;
   const prompt = u.prompt_tokens ?? u.input_tokens ?? u.inputTokens;
   const completion = u.completion_tokens ?? u.output_tokens ?? u.outputTokens;
-  return {
-    prompt_tokens: prompt,
-    completion_tokens: completion,
-    total_tokens:
-      u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0),
+  const total = u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0);
+  if (prompt == null && completion == null && total == null) return undefined;
+  return { prompt_tokens: prompt ?? 0, completion_tokens: completion ?? 0, total_tokens: total ?? 0 };
+}
+
+function isZeroUsage(u) {
+  return !u || (!u.prompt_tokens && !u.completion_tokens && !u.total_tokens);
+}
+
+/** 从 SDK 的 rawResponses 里兜底翻出 usage */
+function usageFromRaw(list) {
+  const seen = new Set();
+  const walk = (o, depth) => {
+    if (!o || typeof o !== "object" || depth > 5) return null;
+    if (seen.has(o)) return null;
+    seen.add(o);
+    if (USAGE_KEYS.some((k) => typeof o[k] === "number")) return o;
+    for (const v of Object.values(o)) {
+      const hit = walk(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
   };
+  for (const r of Array.isArray(list) ? list : [list]) {
+    const hit = walk(r, 0);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 function timingSafeEqualStr(a, b) {
@@ -169,7 +193,8 @@ function openaiBody({ model, text, usage }) {
         finish_reason: "stop",
       },
     ],
-    usage: usage || undefined,
+    // 拿不到真实统计就不返回，避免客户端显示假的 0
+    ...(usage && !isZeroUsage(usage) ? { usage } : {}),
   };
 }
 
@@ -237,7 +262,7 @@ exports.main = async (event, context) => {
     const payload = openaiBody({
       model: body.model,
       text: result.text,
-      usage: normalizeUsage(result.usage),
+      usage: normalizeUsage(result.usage) || normalizeUsage(usageFromRaw(result.rawResponses)),
     });
 
     if (ctx.isHttp) return respond(200, payload);

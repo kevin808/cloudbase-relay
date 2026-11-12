@@ -295,15 +295,62 @@ function sseChunk({ id, created, model, delta, finish }) {
   })}\n\n`;
 }
 
+const USAGE_KEYS = [
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "input_tokens",
+  "output_tokens",
+];
+
 function normalizeUsage(u) {
-  if (!u) return undefined;
+  if (!u || typeof u !== "object") return undefined;
   const prompt = u.prompt_tokens ?? u.input_tokens ?? u.inputTokens;
   const completion = u.completion_tokens ?? u.output_tokens ?? u.outputTokens;
+  const total = u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0);
+  if (prompt == null && completion == null && total == null) return undefined;
   return {
-    prompt_tokens: prompt,
-    completion_tokens: completion,
-    total_tokens: u.total_tokens ?? u.totalTokens ?? (prompt || 0) + (completion || 0),
+    prompt_tokens: prompt ?? 0,
+    completion_tokens: completion ?? 0,
+    total_tokens: total ?? 0,
   };
+}
+
+function isZeroUsage(u) {
+  return !u || (!u.prompt_tokens && !u.completion_tokens && !u.total_tokens);
+}
+
+/** 从 SDK 的 rawResponses 里兜底翻出 usage（上游字段名可能不统一） */
+function usageFromRaw(list) {
+  const seen = new Set();
+  const walk = (o, depth) => {
+    if (!o || typeof o !== "object" || depth > 5) return null;
+    if (seen.has(o)) return null;
+    seen.add(o);
+    if (USAGE_KEYS.some((k) => typeof o[k] === "number")) return o;
+    for (const v of Object.values(o)) {
+      const hit = walk(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  for (const r of Array.isArray(list) ? list : [list]) {
+    const hit = walk(r, 0);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** 依次尝试多个来源，取第一个非零的 usage */
+function resolveUsage(candidates) {
+  let fallback;
+  for (const c of candidates) {
+    const u = normalizeUsage(c);
+    if (!u) continue;
+    if (!isZeroUsage(u)) return u;
+    fallback = fallback || u;
+  }
+  return fallback;
 }
 
 /** 上游异常映射：并发超限 → 429，其余 → 502 */
@@ -409,7 +456,7 @@ app.get("/diag", requireKey, async (req, res) => {
       model: ALLOWED_MODELS[0],
       ms: Date.now() - start,
       textLength: (r.text || "").length,
-      usage: normalizeUsage(r.usage),
+      usage: resolveUsage([r.usage, usageFromRaw(r.rawResponses)]),
     };
   } catch (err) {
     report.probe = {
@@ -466,6 +513,10 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
   for (const k of ["temperature", "top_p", "max_tokens", "stop"]) {
     if (body[k] !== undefined) params[k] = body[k];
   }
+  // SDK 不会主动要 usage，这里透传给上游，最后一帧才会带 token 统计
+  if (body.stream) {
+    params.stream_options = body.stream_options || { include_usage: true };
+  }
 
   const id = "chatcmpl-" + crypto.randomBytes(12).toString("hex");
   const created = Math.floor(Date.now() / 1000);
@@ -473,7 +524,20 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
 
   try {
     if (body.stream) {
-      const r = await model.streamText(params);
+      let r;
+      try {
+        r = await model.streamText(params);
+      } catch (e) {
+        // 个别上游不认 stream_options，退回不带 usage 的请求，别为此整条链路失败
+        const msg = String((e && e.message) || e);
+        if (params.stream_options && /stream_options|400|invalid/i.test(msg)) {
+          console.warn("[warn] 上游拒绝了 stream_options，改用不带 usage 的流式请求");
+          delete params.stream_options;
+          r = await model.streamText(params);
+        } else {
+          throw e;
+        }
+      }
       if (LOG_REQUESTS) {
         console.log(
           `[chat] stream model=${body.model} auth=${creds.kind} ttfb=${Date.now() - startedAt}ms`
@@ -491,6 +555,26 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       }
       if (!aborted) {
         res.write(sseChunk({ id, created, model: body.model, delta: {}, finish: "stop" }));
+
+        // OpenAI 约定：include_usage 时最后补一帧只带 usage 的空 choices
+        let usage;
+        try {
+          usage = resolveUsage([await r.usage]);
+        } catch (e) {
+          console.error("[usage] stream usage unavailable:", (e && e.message) || e);
+        }
+        if (usage && !isZeroUsage(usage)) {
+          res.write(
+            `data: ${JSON.stringify({
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model: body.model,
+              choices: [],
+              usage,
+            })}\n\n`
+          );
+        }
         res.write("data: [DONE]\n\n");
       }
       res.end();
@@ -506,7 +590,8 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
         `[chat] model=${body.model} auth=${creds.kind} total=${Date.now() - startedAt}ms`
       );
     }
-    res.json({
+    const usage = resolveUsage([r.usage, usageFromRaw(r.rawResponses)]);
+    const payload = {
       id,
       object: "chat.completion",
       created,
@@ -518,8 +603,10 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
           finish_reason: "stop",
         },
       ],
-      usage: normalizeUsage(r.usage),
-    });
+    };
+    // 拿不到真实统计时宁可不返回，也不要给客户端一个假的 0
+    if (usage && !isZeroUsage(usage)) payload.usage = usage;
+    res.json(payload);
   } catch (err) {
     sendUpstreamError(res, err);
   }
