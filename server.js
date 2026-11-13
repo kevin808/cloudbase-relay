@@ -368,6 +368,66 @@ function stripDsml(text) {
   return { text: text.slice(0, m.index).replace(/\s+$/, ""), leaked: true };
 }
 
+/**
+ * 流式 DSML 过滤器（跨 chunk）。
+ * 标记可能被 chunk 边界切开（例如 "<" 在上一帧，"‖DSML‖…" 在下一帧），
+ * 所以不能逐帧独立匹配。这里维护一个缓冲区：
+ *   - 缓冲区里可能是标记开头的尾部，先扣住，等下一帧再判定；
+ *   - 一旦确认命中 DSML，之后的所有 content 都屏蔽。
+ * push(text) 返回本次可以安全输出的文本；flush() 在流结束时取回剩余安全文本。
+ */
+function createDsmlStreamFilter() {
+  let buf = "";
+  let blocked = false;
+  let leaked = false;
+
+  // 一个以 "<" 开头、尚未闭合的片段，可能是某个标记的前缀
+  const HOLD_RE = /<\/?[｜|‖]{0,2}(?:D(?:S(?:M(?:L)?)?)?)?[^>]*$/;
+
+  return {
+    get leaked() {
+      return leaked;
+    },
+    push(text) {
+      if (blocked || !text) return "";
+      buf += text;
+
+      const m = buf.match(DSML_PATTERN);
+      if (m) {
+        blocked = true;
+        leaked = true;
+        const safe = buf.slice(0, m.index).replace(/\s+$/, "");
+        buf = "";
+        if (LOG_REQUESTS) console.warn("[dsml] 流式检测到工具格式泄漏，已截断后续 content");
+        return safe;
+      }
+
+      // 末尾若像标记的前缀，扣住这部分，其余可以输出
+      const hold = buf.match(HOLD_RE);
+      if (hold) {
+        const safe = buf.slice(0, hold.index);
+        buf = buf.slice(hold.index);
+        return safe;
+      }
+      const out = buf;
+      buf = "";
+      return out;
+    },
+    flush() {
+      if (blocked) return "";
+      const rest = buf;
+      buf = "";
+      // 流结束时仍扣住的内容：若完整匹配则截断，否则原样放行
+      const m = rest.match(DSML_PATTERN);
+      if (m) {
+        leaked = true;
+        return rest.slice(0, m.index).replace(/\s+$/, "");
+      }
+      return rest;
+    },
+  };
+}
+
 /** 上游异常映射：并发超限 → 429，其余 → 502 */
 function sendUpstreamError(res, err) {
   const msg = String((err && err.message) || err);
@@ -543,16 +603,19 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
 
   try {
     if (body.stream) {
-      let r;
+      // 走底层 doStream，不经过 ReactModel：ReactModel 会自动执行工具循环，
+      // 且只暴露 textStream，会丢掉 delta.tool_calls。这里直接读原始 chunk。
+      const simple = getApp(creds).ai().createModel(PROVIDER).model;
+      let upstream;
       try {
-        r = await model.streamText(params);
+        upstream = await simple.doStream(params);
       } catch (e) {
         // 个别上游不认 stream_options，退回不带 usage 的请求，别为此整条链路失败
         const msg = String((e && e.message) || e);
         if (params.stream_options && /stream_options|400|invalid/i.test(msg)) {
           console.warn("[warn] 上游拒绝了 stream_options，改用不带 usage 的流式请求");
           delete params.stream_options;
-          r = await model.streamText(params);
+          upstream = await simple.doStream(params);
         } else {
           throw e;
         }
@@ -562,26 +625,65 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
           `[chat] stream model=${body.model} auth=${creds.kind} ttfb=${Date.now() - startedAt}ms`
         );
       }
+
       sseHeaders(res);
       let aborted = false;
       req.on("close", () => {
         aborted = true;
       });
-      res.write(sseChunk({ id, created, model: body.model, delta: { role: "assistant" } }));
-      for await (const text of r.textStream) {
-        if (aborted) break;
-        if (text) res.write(sseChunk({ id, created, model: body.model, delta: { content: text } }));
-      }
-      if (!aborted) {
-        res.write(sseChunk({ id, created, model: body.model, delta: {}, finish: "stop" }));
 
-        // OpenAI 约定：include_usage 时最后补一帧只带 usage 的空 choices
-        let usage;
-        try {
-          usage = resolveUsage([await r.usage]);
-        } catch (e) {
-          console.error("[usage] stream usage unavailable:", (e && e.message) || e);
+      const dsml = createDsmlStreamFilter();
+      const emit = (delta, finish) => {
+        if (aborted) return;
+        res.write(sseChunk({ id, created, model: body.model, delta, finish }));
+      };
+
+      emit({ role: "assistant" });
+
+      let sawToolCalls = false;
+      let chunkCount = 0;
+      let finishReason = null;
+      let lastUsage;
+
+      for await (const chunk of upstream) {  // doStream 直接返回异步流
+        if (aborted) break;
+        chunkCount++;
+        const choice = (chunk && chunk.choices && chunk.choices[0]) || {};
+        const delta = choice.delta || {};
+
+        // 文本：经过跨 chunk 的 DSML 过滤
+        if (typeof delta.content === "string" && delta.content) {
+          const safe = dsml.push(delta.content);
+          if (safe) emit({ content: safe });
         }
+
+        // 工具调用：结构化字段，原样转发，不做过滤
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+          sawToolCalls = true;
+          emit({ tool_calls: delta.tool_calls });
+        }
+
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (chunk && chunk.usage) lastUsage = chunk.usage;
+      }
+
+      if (!aborted && chunkCount === 0) {
+        // 上游给了流却一个 chunk 都没有：这是异常，不能伪装成正常的空回复
+        console.error("[stream] 上游流为空（0 个 chunk）");
+        res.write(`data: ${JSON.stringify({ error: { message: "upstream stream empty" } })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // 流结束：把过滤器里扣住的尾部放行
+      const tail = dsml.flush();
+      if (tail && !aborted) emit({ content: tail });
+
+      if (!aborted) {
+        const reason = sawToolCalls ? "tool_calls" : finishReason || "stop";
+        emit({}, reason);
+
+        const usage = resolveUsage([lastUsage, usageFromRaw(lastUsage)]);
         if (usage && !isZeroUsage(usage)) {
           res.write(
             `data: ${JSON.stringify({
@@ -598,7 +700,10 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       }
       res.end();
       if (LOG_REQUESTS) {
-        console.log(`[chat] stream done abort=${aborted} total=${Date.now() - startedAt}ms`);
+        console.log(
+          `[chat] stream done abort=${aborted} tools=${sawToolCalls ? "yes" : "no"} ` +
+            `leak=${dsml.leaked} total=${Date.now() - startedAt}ms`
+        );
       }
       return;
     }
