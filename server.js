@@ -353,6 +353,21 @@ function resolveUsage(candidates) {
   return fallback;
 }
 
+/**
+ * DSML 兜底过滤：DeepSeek 偶发把原生工具调用格式写进 content。
+ * 同时覆盖单竖线 ｜ 与双竖线 ‖ 两种变体（两者视觉几乎一致，必须按字节匹配）。
+ * 命中后截断到标记之前，返回 {text, leaked}。
+ */
+const DSML_PATTERN = /<\/?[｜|‖]{1,2}(?:DSML[｜|‖]{1,2})?(?:tool[｜|‖]{1,2}calls|tool_calls|invoke|parameter)[^>]*>?/;
+
+function stripDsml(text) {
+  if (typeof text !== "string" || !text) return { text: text || "", leaked: false };
+  const m = text.match(DSML_PATTERN);
+  if (!m) return { text, leaked: false };
+  if (LOG_REQUESTS) console.warn("[dsml] 检测到工具格式泄漏到 content，已截断");
+  return { text: text.slice(0, m.index).replace(/\s+$/, ""), leaked: true };
+}
+
 /** 上游异常映射：并发超限 → 429，其余 → 502 */
 function sendUpstreamError(res, err) {
   const msg = String((err && err.message) || err);
@@ -513,6 +528,10 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
   for (const k of ["temperature", "top_p", "max_tokens", "stop"]) {
     if (body[k] !== undefined) params[k] = body[k];
   }
+  // 工具定义必须透传：否则上游不知道有工具，模型会把原生工具格式（DSML）写进 content
+  for (const k of ["tools", "tool_choice", "parallel_tool_calls"]) {
+    if (body[k] !== undefined) params[k] = body[k];
+  }
   // SDK 不会主动要 usage，这里透传给上游，最后一帧才会带 token 统计
   if (body.stream) {
     params.stream_options = body.stream_options || { include_usage: true };
@@ -584,13 +603,26 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       return;
     }
 
-    const r = await model.generateText(params);
+    // 直接走底层 doGenerate，不经过 SDK 的 ReactModel：后者会自动执行工具循环，
+    // 而工具应由客户端执行。这里保留上游原始 choices，tool_calls 原样回传。
+    const raw = await getApp(creds).ai().createModel(PROVIDER).model.doGenerate(params);
+    const upstreamChoice = (raw.choices && raw.choices[0]) || {};
+    const upstreamMsg = upstreamChoice.message || {};
+
+    const hasToolCalls = Array.isArray(upstreamMsg.tool_calls) && upstreamMsg.tool_calls.length > 0;
+    const cleaned = stripDsml(upstreamMsg.content || "");
+
     if (LOG_REQUESTS) {
       console.log(
-        `[chat] model=${body.model} auth=${creds.kind} total=${Date.now() - startedAt}ms`
+        `[chat] model=${body.model} auth=${creds.kind} tools=${hasToolCalls ? "yes" : "no"} ` +
+          `total=${Date.now() - startedAt}ms`
       );
     }
-    const usage = resolveUsage([r.usage, usageFromRaw(r.rawResponses)]);
+
+    const message = { role: "assistant", content: cleaned.text || null };
+    if (hasToolCalls) message.tool_calls = upstreamMsg.tool_calls;
+
+    const usage = resolveUsage([raw.usage, usageFromRaw(raw.rawResponse)]);
     const payload = {
       id,
       object: "chat.completion",
@@ -599,8 +631,8 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: r.text || "" },
-          finish_reason: "stop",
+          message,
+          finish_reason: hasToolCalls ? "tool_calls" : upstreamChoice.finish_reason || "stop",
         },
       ],
     };
